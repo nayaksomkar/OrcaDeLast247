@@ -7,16 +7,20 @@ provider_api_key(cfg, name): return the API key for a given provider name.
 
 Data flow (one cycle):
     1. Compute retention window start (from_time = now - retention_days).
-    2. Build eligible provider list (providers with an API key or base URL).
-    3. Try each provider in order; stop on the first that returns ≥1 article.
-    4. Normalize ProviderArticle → Article (add id, fetched_at, provider).
-    5. Deduplicate by URL within the run (DB handles cross-run dupes via UNIQUE).
-    6. Upsert each valid article into the DB.
-    7. LLM phase: for each upserted article (max cfg.max_articles = 7), send
+    2. SAMPLE_DATA mode (cfg.sample_data=true): skip the provider loop and
+       load data/sample_news.json via sample_data.load_sample_articles()
+       instead — every other step below is shared with the real path.
+    3. Build eligible provider list (providers with an API key or base URL).
+    4. Try each provider in order; stop on the first that returns ≥1 article.
+    5. Normalize ProviderArticle → Article (add id, fetched_at, provider —
+       sample data carries its own provider tag per article).
+    6. Deduplicate by URL within the run (DB handles cross-run dupes via UNIQUE).
+    7. Upsert each valid article into the DB.
+    8. LLM phase: for each upserted article (max cfg.max_articles = 7), send
        system prompt + article data to LLMPing /chat and store the parsed
        answer on the row (llm_* columns). Failures are logged and skipped.
-    8. Delete articles older than the retention window.
-    9. Return IngestionResult summary.
+    9. Delete articles older than the retention window.
+   10. Return IngestionResult summary.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ from llmping import build_article_prompt, resolve_system_prompt
 from llmping import chat as llmping_chat
 from models import Article, IngestionResult
 from providers import GNews, NewsAPI, NewsDataIO, Provider, WebFetch
+import sample_data
 
 logger = logging.getLogger(__name__)
 
@@ -70,38 +75,49 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
         source_time=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
 
-    provider_list = build_providers(cfg)
-    if not provider_list:
-        logger.warning("[ingest] no providers configured — skipping run")
-        return result
+    if cfg.sample_data:
+        # --- SAMPLE_DATA mode -------------------------------------------
+        # Testing shortcut: skip the provider fallback loop entirely and
+        # feed the bundled sample articles through the exact same pipeline
+        # below (cap → normalize → dedup → upsert → LLMPing → retention).
+        # Provider keys are ignored here; each sample entry carries its own
+        # provider attribution (newsapi/gnews/newsdata) on .provider.
+        logger.info("[SAMPLE] SAMPLE_DATA=true — real news APIs are NOT called")
+        raw_articles = sample_data.load_sample_articles()
+        winning_provider = ""       # per-article attribution comes from the data
+    else:
+        provider_list = build_providers(cfg)
+        if not provider_list:
+            logger.warning("[ingest] no providers configured — skipping run")
+            return result
 
-    # --- Sequential fallback loop ---
-    raw_articles = []
-    winning_provider = ""
+        # --- Sequential fallback loop ---
+        raw_articles = []
+        winning_provider = ""
 
-    for p in provider_list:
-        try:
-            fetched = await p.fetch(
-                api_key=provider_api_key(cfg, p.name),
-                lang=cfg.language,
-                max_articles=cfg.max_articles,
-                from_time=from_time,
-            )
-        except Exception as exc:
-            # Log and try the next provider — a single failure is not fatal.
-            logger.warning("[ingest] %s failed: %s", p.name, exc)
-            continue
+        for p in provider_list:
+            try:
+                fetched = await p.fetch(
+                    api_key=provider_api_key(cfg, p.name),
+                    lang=cfg.language,
+                    max_articles=cfg.max_articles,
+                    from_time=from_time,
+                )
+            except Exception as exc:
+                # Log and try the next provider — a single failure is not fatal.
+                logger.warning("[ingest] %s failed: %s", p.name, exc)
+                continue
 
-        if not fetched:
-            logger.warning("[ingest] %s returned 0 articles", p.name)
-            continue
+            if not fetched:
+                logger.warning("[ingest] %s returned 0 articles", p.name)
+                continue
 
-        # First provider with usable articles wins.
-        raw_articles = fetched
-        winning_provider = p.name
-        break
+            # First provider with usable articles wins.
+            raw_articles = fetched
+            winning_provider = p.name
+            break
 
-    result.provider = winning_provider
+    result.provider = winning_provider if not cfg.sample_data else "sample"
     result.total = len(raw_articles)
 
     if not raw_articles:
@@ -142,7 +158,9 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
             category=pa.category or None,
             published_at=pa.published_at,
             fetched_at=now,
-            provider=winning_provider,
+            # SAMPLE_DATA mode tags each article with its own provider
+            # (empty for real providers → the winning provider's name).
+            provider=pa.provider or winning_provider,
         )
 
         try:
@@ -151,6 +169,7 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
             await asyncio.to_thread(upsert_article, conn, article)
             inserted += 1
             stored_this_run.append(article)
+            logger.info("[DB] Stored article: %s (%s)", article.title, article.provider)
         except Exception as exc:
             logger.warning("[ingest] failed to store %s: %s", pa.url, exc)
             skipped += 1
@@ -164,7 +183,9 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
     # A failure for one article never aborts the run — the article stays
     # stored with llm_answer=None and the next article is processed.
     logger.info("[ingest] LLM parse phase: %d article(s) queued", len(stored_this_run))
-    for article in stored_this_run:
+    total_articles_to_parse = len(stored_this_run)
+    for idx, article in enumerate(stored_this_run, 1):
+        logger.info("[LLM] Processing article %d/%d: %s", idx, total_articles_to_parse, article.title)
         try:
             res = await llmping_chat(
                 cfg,
@@ -195,6 +216,21 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
         logger.info(
             "[ingest] LLM phase done: parsed=%d failed=%d",
             result.parsed, result.parse_failed,
+        )
+
+    # --- Sample-mode completion summary ------------------------------------
+    # Explicit end-of-run report for SAMPLE_DATA mode (failed = skipped during
+    # normalize/upsert + LLM parse failures — dirty articles are counted, never
+    # silently discarded).
+    if cfg.sample_data and raw_articles:
+        failed = skipped + result.parse_failed
+        logger.info(
+            "[SAMPLE] Sample ingestion completed\n"
+            "Articles loaded: %d\n"
+            "LLM processed: %d\n"
+            "Database stored: %d\n"
+            "Failed: %d",
+            len(raw_articles), result.parsed, inserted, failed,
         )
 
     # --- Retention sweep ---

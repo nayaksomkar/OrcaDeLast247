@@ -203,6 +203,29 @@ uv run python scripts/test_llmping_live.py     # {"query": "Hello"} + one real a
 TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=7 uv run python scripts/test_one_cycle_live.py
 ```
 
+### Sample Data Mode
+
+`SAMPLE_DATA=true` in `.env` (default `false`) switches the runner to local
+sample data instead of the real news APIs:
+
+- Loads the bundled `data/sample_news.json` — 2 sample articles for each of
+  NewsAPI, GNews and NewsData.io (6 in total), no API keys inside.
+- Sends them through the SAME pipeline as real data: provider normalization →
+  `MAX_ARTICLES` cap → URL dedup → Turso upsert → per-article LLMPing parse →
+  `llm_*` columns → API. Nothing is inserted directly into the DB.
+- Consumes zero news-API quota and still exercises the complete flow, including
+  the real LLMPing service (6 sequential calls per run).
+- Set `SAMPLE_DATA=false` (or remove the line) to use the real providers
+  with `MAX_ARTICLES=7` / `INGEST_INTERVAL=8h` exactly as before.
+
+Try it end-to-end (writes to a throwaway local DB, never your production one):
+
+```bash
+SAMPLE_DATA=true TURSO_DATABASE_URL=file:./data/sample_test.db uv run python main.py
+# ...or without the HTTP server:
+uv run python scripts/test_sample_mode_e2e.py
+```
+
 ---
 
 ## Docker

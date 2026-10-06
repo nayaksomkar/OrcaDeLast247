@@ -23,7 +23,7 @@ def clean_env(monkeypatch):
         "NEWS_LANGUAGE", "MAX_ARTICLES", "CORS_ALLOW_ORIGINS",
         "LLMPING_BASE_URL", "LLMPING_CHAT_PATH", "LLMPING_TIMEOUT",
         "LLMPING_API_TOKEN", "LLM_SYSTEM_PROMPT", "LLM_MAX_CONTENT_CHARS",
-        "LLMPING_API_URL",
+        "LLMPING_API_URL", "SAMPLE_DATA",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -86,6 +86,24 @@ def test_load_config_env_overrides_win(monkeypatch):
     assert cfg.ingest_interval == 1800          # 30m in seconds
     assert cfg.ingest_timeout == 60
     assert cfg.cors_origins == ["https://app.last247.dev", "https://other.dev"]
+
+
+def test_load_config_sample_data_defaults_off(monkeypatch):
+    """SAMPLE_DATA is false unless explicitly enabled — never the default."""
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    assert load_config().sample_data is False
+
+    for junk in ("no", "false", "0", "garbage-typo"):
+        monkeypatch.setenv("SAMPLE_DATA", junk)
+        assert load_config().sample_data is False
+
+
+def test_load_config_sample_data_truthy_values(monkeypatch):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+
+    for value in ("true", "TRUE", "1", "yes", "on"):
+        monkeypatch.setenv("SAMPLE_DATA", value)
+        assert load_config().sample_data is True, value
 
 
 def test_load_config_llmping_env_overrides_win(monkeypatch):

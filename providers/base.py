@@ -45,6 +45,11 @@ class ProviderArticle:
     source: str = ""
     author: str = ""
     category: str = ""
+    # attribution override: empty for real providers (run_ingestion stamps
+    # the winning provider's name); SAMPLE_DATA mode sets it per article so a
+    # single mixed batch can carry newsapi/gnews/newsdata sources through the
+    # exact same downstream pipeline.
+    provider: str = ""
 
 
 class Provider(ABC):

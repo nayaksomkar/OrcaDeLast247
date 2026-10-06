@@ -1,0 +1,75 @@
+{
+  "_comment": "Sample articles for SAMPLE_DATA=true. Grouped by provider key; the loader feeds each entry through the same ProviderArticle normalization and ingest pipeline the real providers use (cap by MAX_ARTICLES, dedup, upsert, LLMPing parse, retention). No API keys are stored in this file — it is safe to commit.",
+  "newsapi": [
+    {
+      "title": "Sample: Chipmaker Unveils Cooled Quantum Processor With Record Qubit Count",
+      "description": "The company says its 1,600-qubit prototype cuts error rates by half when operated at millikelvin temperatures.",
+      "content": "Researchers at the fictional Chipmaker labs demonstrated a cryogenically cooled quantum processor with 1,600 qubits, a 50% reduction in gate errors over the previous generation, and error correction running natively on the chip. The team plans an open evaluation program for university labs in the coming months.",
+      "url": "https://example.com/newsapi/sample-quantum-processor",
+      "image_url": "https://example.com/images/newsapi-quantum.jpg",
+      "source": "The Tech Chronicle",
+      "author": "Maya Okafor",
+      "category": "technology",
+      "published_at": "2026-10-06T06:30:00Z"
+    },
+    {
+      "title": "Sample: Central Bank Cuts Benchmark Rate For The First Time In Two Years",
+      "description": "Policymakers cited cooling inflation data and softer labor statistics in a unanimous 8-0 decision.",
+      "content": "The fictional Central Bank lowered its benchmark rate by 25 basis points to 4.25%, marking the first reduction in 24 months. Markets rallied on the announcement as the statement flagged 'durable progress' on core inflation while warning that services prices remain sticky.",
+      "url": "https://example.com/newsapi/sample-central-bank-cut",
+      "image_url": "https://example.com/images/newsapi-central-bank.jpg",
+      "source": "Business Ledger",
+      "author": "Daniel Reyes",
+      "category": "economy",
+      "published_at": "2026-10-06T07:15:00Z"
+    }
+  ],
+  "gnews": [
+    {
+      "title": "Sample: Atlantic Wind Farm Begins Delivering Power To 500,000 Homes",
+      "description": "The 980 MW offshore installation completed its final turbine connection ahead of schedule.",
+      "content": "The fictional Atlantic offshore wind farm delivered first commercial power to the coastal grid, spanning 90 turbines in water 40 meters deep. Operators said commissioning finished six weeks early despite the harsh winter construction window, and the utility expects the full 980 MW capacity online by spring.",
+      "url": "https://example.com/gnews/sample-atlantic-wind-farm",
+      "image_url": "https://example.com/images/gnews-wind-farm.jpg",
+      "source": "World Weather Watch",
+      "author": "Sofia Lindqvist",
+      "category": "environment",
+      "published_at": "2026-10-06T05:05:00Z"
+    },
+    {
+      "title": "Sample: Asteroid Probe Returns Concentrated Water Samples To Earth",
+      "description": "Curation teams report the capsule landed intact with kilos of regolith rich in water-bearing minerals.",
+      "content": "The fictional Orbiter return capsule touched down in the desert range with sealed regolith samples whose preliminary analysis shows clay and hydroxyl-bearing minerals at concentrations ten times higher than earlier missions. Science teams begin seventy days of sterile opening next week.",
+      "url": "https://example.com/gnews/sample-asteroid-probe-return",
+      "image_url": "https://example.com/images/gnews-asteroid.jpg",
+      "source": "Skyline Observatory",
+      "author": "Priya Raman",
+      "category": "science",
+      "published_at": "2026-10-06T05:20:00Z"
+    }
+  ],
+  "newsdata": [
+    {
+      "title": "Sample: Weight-Loss Pill Shows 14% Mean Reduction In Advanced Trial",
+      "description": "An oral GLP-1 competitor reported sizable two-year results with manageable side effects at the highest dose.",
+      "content": "The fictional Pharma consortium reported Phase 3 results for an oral GLP-1 analog showing a 14% mean body-weight reduction at 24 months and durable lipid improvements. Regulators will review the filing in Q1; analysts expect launch pricing negotiations to dominate coverage decisions.",
+      "url": "https://example.com/newsdata/sample-weight-loss-pill",
+      "image_url": "https://example.com/images/newsdata-glp1.jpg",
+      "source": "Health Today Network",
+      "author": "Alice Gupta, Tom Whelan",
+      "category": "health",
+      "published_at": "2026-10-06T06:00:00Z"
+    },
+    {
+      "title": "Sample: Underdogs Complete Historic Comeback In Continental Cup Semifinal",
+      "description": "Trailing 2-0 at the hour mark, the visitors scored three times in fifteen minutes.",
+      "content": "The fictional Meridian Rovers overturned a 2-0 deficit in the continental cup semifinal with three goals in fifteen minutes, advancing on aggregate. The captain called it the club's biggest night in forty years as supporters spilled onto the streets after the final whistle.",
+      "url": "https://example.com/newsdata/sample-continental-cup-comeback",
+      "image_url": "https://example.com/images/newsdata-rovers.jpg",
+      "source": "Sports Wire",
+      "author": "Marco Bellini",
+      "category": "sports",
+      "published_at": "2026-10-06T06:45:00Z"
+    }
+  ]
+}

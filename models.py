@@ -77,7 +77,8 @@ class IngestionResult:
     """
     Summary of one ingestion cycle returned by run_ingestion().
 
-    provider   : name of the provider that won the fallback chain ("" if all failed).
+    provider   : name of the provider that won the fallback chain ("sample"
+                 in SAMPLE_DATA mode, "" if all providers failed).
     total      : raw article count returned by the winning provider.
     inserted   : rows actually upserted into the DB.
     skipped    : articles dropped (no title/URL, in-run dupe, or DB error).

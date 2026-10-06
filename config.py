@@ -100,6 +100,11 @@ class Config:
     ingest_timeout: int = 900       # seconds, covers fetch + 7 sequential LLM calls
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
 
+    # SAMPLE_DATA mode (testing): when true the real news APIs are NOT called
+    # and data/sample_news.json is fed through the same pipeline instead.
+    # Default false — production always uses the real providers.
+    sample_data: bool = False
+
     # LLMPing (LLM Brain)
     llmping_base_url: str = "https://llmping.onrender.com"
     llmping_chat_path: str = "/chat"
@@ -179,6 +184,12 @@ def load_config() -> Config:
     if raw_cors:
         cfg.cors_origins = [o.strip() for o in raw_cors.split(",") if o.strip()]
     # else keep the default ["*"]
+
+    # SAMPLE_DATA mode: strict truthy set — anything else (including unset)
+    # means false so a typo can never accidentally turn sample mode on.
+    cfg.sample_data = (
+        os.getenv("SAMPLE_DATA", "").strip().lower() in ("1", "true", "yes", "on")
+    )
 
     return cfg
 
