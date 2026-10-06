@@ -1,0 +1,33 @@
+# Environment
+.env
+.env.local
+
+# Local databases
+*.db
+*.db-journal
+
+# Built binaries
+/bin/
+
+# Test binaries
+*.test
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local tool directories
+.codegraph
+.commandcode/
+.omo/
+.kilo/
+
+# Python cache & tests
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/

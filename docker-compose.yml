@@ -1,0 +1,25 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: last247-api
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL:-file:./news.db}
+      - TURSO_AUTH_TOKEN=${TURSO_AUTH_TOKEN:-}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
+      - INGEST_INTERVAL=${INGEST_INTERVAL:-6h}
+      - INGEST_TIMEOUT=${INGEST_TIMEOUT:-120s}
+      - RETENTION_DAYS=${RETENTION_DAYS:-7}
+    volumes:
+      # Persist local SQLite file if file:./news.db is used
+      - db-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  db-data:

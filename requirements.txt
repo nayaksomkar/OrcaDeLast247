@@ -1,0 +1,26 @@
+# Last247 News API Service — Python dependencies
+#
+# Install:   pip install -r requirements.txt
+# Dev/test:  pip install -r requirements.txt  (test deps included)
+
+# --- HTTP server ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0    # ASGI server (with uvloop + httptools for speed)
+
+# --- Async HTTP client (provider fetches + test mocking) ---
+httpx>=0.27.0
+
+# --- .env file loading ---
+python-dotenv>=1.0.0
+
+# --- Data validation / serialization ---
+pydantic>=2.7.0
+
+# --- Remote Turso database (only needed for libsql:// URLs) ---
+# For local file: URLs the built-in sqlite3 module is used instead.
+libsql-experimental>=0.0.10
+
+# --- Test suite ---
+pytest>=8.2.0
+pytest-asyncio>=0.23.0      # async test support
+respx>=0.21.0                # httpx request mocking for provider tests
