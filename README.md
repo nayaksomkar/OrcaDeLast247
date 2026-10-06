@@ -68,6 +68,85 @@ The system prompt is an instruction layer, kept in its own section — it is nev
 
 See [docs/UI_API.md](./docs/UI_API.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
 
+### Verified response samples (real, captured from the live service)
+
+**`GET /health`**
+```json
+{"status": "ok", "timestamp": "2026-10-06T23:25:26Z"}
+```
+
+**`GET /api/news?limit=2`** (first item full, second abbreviated;
+`published_at`/`fetched_at` are real wire values — ISO 8601 UTC `+00:00`)
+```json
+{
+  "total": 6,
+  "limit": 2,
+  "offset": 0,
+  "articles": [
+    {
+      "id": "1fc245d26b695479",
+      "title": "Sample: Central Bank Cuts Benchmark Rate For The First Time In Two Years",
+      "description": "Policymakers cited cooling inflation data and softer labor statistics in a unanimous 8-0 decision.",
+      "content": "The Central Bank lowered its benchmark rate by 25 basis points to 4.25%...",
+      "url": "https://example.com/newsapi/sample-central-bank-cut",
+      "image_url": "https://example.com/images/newsapi-central-bank.jpg",
+      "source": "Business Ledger",
+      "author": "Daniel Reyes",
+      "category": "economy",
+      "published_at": "2026-10-06T07:15:00+00:00",
+      "fetched_at": "2026-10-06T23:21:03.684389+00:00",
+      "provider": "newsapi",
+      "llm_answer": {
+        "title": "Sample: Central Bank Cuts Benchmark Rate For The First Time In Two Years",
+        "url": "https://example.com/newsapi/sample-central-bank-cut",
+        "source": "Business Ledger",
+        "author": "Daniel Reyes",
+        "category": "economy",
+        "published_at": "2026-10-06T07:15:00Z",
+        "summary": "The Central Bank cut its benchmark rate by 25 basis points to 4.25%, the first rate cut in 24 months…",
+        "key_points": [
+          "Cut benchmark rate by 25 basis points to 4.25%",
+          "First rate cut in 24 months",
+          "Decision was unanimous 8-0"
+        ]
+      }
+    },
+    { "id": "786ba8e6a0a82dae", "title": "Sample: Underdogs Complete Historic Comeback In Continental Cup Semifinal", "provider": "newsdata" }
+  ]
+}
+```
+`llm_answer` is a JSON string on the wire (the `answer` from the LLM Brain,
+stored as received); shown expanded here for readability — in real responses
+all 6 articles had the same strict JSON shape, verified live.
+
+**`GET /api/news/{id}`** — 200 with the same single-article object; unknown id →
+`404 {"error": "article with id \"ffffffffffffffff\" not found", "code": "NOT_FOUND"}`
+
+**`GET /api/stats`** (after a run)
+```json
+{
+  "total_articles": 6,
+  "last_ingestion": {
+    "provider": "",
+    "total": 0,
+    "inserted": 0,
+    "skipped": 0,
+    "deleted": 0,
+    "parsed": 0,
+    "parse_failed": 0,
+    "source_time": "2026-10-06T23:25:27Z"
+  }
+}
+```
+
+**`POST /api/ingest`** — returns the same `last_ingestion` shape wrapped as
+`{"success": true, "result": {...}}`; a real newsapi run measured:
+`total=6 fetched → inserted=6 → parsed=6 → parse_failed=0` (LLM Brain: groq,
+model `openai/gpt-oss-20b`).
+
+**Invalid params** → `422` validation error, not a silent clamp:
+`{"detail":[{"type":"greater_than_equal","loc":["query","limit"],"msg":"Input should be greater than or equal to 1","input":"0","ctx":{"ge":1}}]}`
+
 ---
 
 ## Database Schema
