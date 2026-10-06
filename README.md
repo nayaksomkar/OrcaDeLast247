@@ -37,7 +37,7 @@ The service tries providers in order and stops on the first one that returns usa
 | Order | Provider    | Env var          | Endpoint                                |
 |-------|-------------|------------------|-----------------------------------------|
 | 1     | NewsAPI     | `NEWS_API_KEY`   | `https://newsapi.org/v2/everything`     |
-| 2     | GNews       | `GNEWS_API_KEY`  | `https://gnews.io/v4/api/top-headlines` |
+| 2     | GNews       | `GNEWS_API_KEY`  | `https://gnews.io/api/v4/top-headlines` |
 | 3     | NewsData.io | `NEWS_DATA_API_KEY` | `https://newsdata.io/api/1/news`     |
 | 4     | WebFetch    | `WEBFETCH_API_URL` + `WEBFETCH_API_KEY` | configurable              |
 
@@ -66,7 +66,7 @@ The system prompt is an instruction layer, kept in its own section — it is nev
 | `POST` | `/api/ingest` | Trigger a manual ingestion + LLM parse run. |
 | `GET` | `/api/stats` | Total article count and last ingestion result (incl. `parsed`/`parse_failed`). |
 
-See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
+See [docs/UI_API.md](./docs/UI_API.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
 
 ---
 
@@ -135,9 +135,11 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 | `WEBFETCH_API_KEY` | Conditional | `""` | WebFetch API key (optional). |
 | `NEWS_LANGUAGE` | No | `en` | Article language filter. |
 | `MAX_ARTICLES` | No | `7` | Max articles fetched (and LLM-parsed) per run. |
+| `SAMPLE_DATA` | No | `false` | `true`: use bundled sample data (`data/sample_news.json`) instead of real news APIs — testing only, same pipeline otherwise. |
 | `CORS_ALLOW_ORIGINS` | No | `*` | Comma-separated allowed CORS origins. |
 | `LLMPING_BASE_URL` | No | `https://llmping.onrender.com` | LLMPing service base URL. |
 | `LLMPING_CHAT_PATH` | No | `/chat` | Chat endpoint path appended to the base URL. |
+| `LLMPING_API_URL` | No | `""` | Full-URL override for the LLMPing chat endpoint — takes precedence over `LLMPING_BASE_URL` + `LLMPING_CHAT_PATH`. |
 | `LLMPING_TIMEOUT` | No | `60s` | Max duration of one LLMPing `/chat` call. |
 | `LLMPING_API_TOKEN` | No | `""` | Optional Bearer token — sent only when set (LLMPing currently requires none). |
 | `LLM_SYSTEM_PROMPT` | No | (placeholder) | System instructions sent with every article. The final editorial prompt goes here. |
@@ -286,15 +288,15 @@ The `Article` model (`models.py`) is the canonical data shape for all API respon
 interface Article {
   id: string;            // 16-char hex, SHA-256(URL)[:16], deterministic
   title: string;         // always present, non-empty
-  description?: string;  // may be absent
+  description?: string;  // may be absent (omitted when empty)
   content?: string;      // may be absent
   url: string;           // always present, non-empty, UNIQUE
   image_url?: string;    // may be absent
   source?: string;       // publisher name, may be absent
   author?: string;       // may be absent
   category?: string;     // single category, may be absent
-  published_at: string;  // ISO 8601 / RFC 3339, UTC, always present
-  fetched_at: string;    // ISO 8601 / RFC 3339, UTC, always present
+  published_at: string;  // ISO 8601 UTC ("...+00:00" suffix), always present
+  fetched_at: string;    // ISO 8601 UTC ("...+00:00" suffix), always present
   provider: string;      // "newsapi" | "gnews" | "newsdata" | "webfetch"
   llm_answer?: string;   // parsed answer from the LLM Brain, as received
   llm_provider?: string; // provider LLMPing used for the parse
@@ -305,7 +307,7 @@ interface Article {
 
 The `llm_*` fields are `null`/absent until the article has been processed by the LLMPing phase.
 
-See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full details including `fetch()` examples.
+See [docs/UI_API.md](./docs/UI_API.md) for full details including `fetch()` examples.
 
 ---
 

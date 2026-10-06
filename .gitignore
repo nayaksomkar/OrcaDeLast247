@@ -1,6 +1,9 @@
 # Environment
 .env
-.env.local
+.env.*
+!*.env.example
+!*.env.example/
+.env.example
 *.env
 # Credential files must never be committed (read via environment only).
 *.pem
@@ -11,7 +14,24 @@
 *.db-journal
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 db-data/
+
+# Logs & temp/backup files
+*.log
+*.tmp
+*.bak
+
+# Build artifacts
+dist/
+build/
+
+# OS / IDE files
+.DS_Store
+.idea/
+.vscode/
+Thumbs.db
 
 # Built binaries
 /bin/
@@ -19,7 +39,7 @@ db-data/
 # Test binaries
 *.test
 
-# Go workspace files
+# Go workspace files (Go stack removed; keep the workspace out just in case)
 go.work
 go.work.sum
 
@@ -34,6 +54,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .venv/

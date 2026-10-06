@@ -51,7 +51,7 @@ The Last247 database acts as the **single source of truth** for all news article
 
 ## 2. Table Schema: `news`
 
-The schema is created automatically on application startup via `init_db()` in [`database.py`](file:///home/nsm/Documents/githubREPO/last247DB/database.py). It is strictly **idempotent** (`CREATE TABLE IF NOT EXISTS`).
+The schema is created automatically on application startup via `init_db()` in [`database.py`](./database.py). It is strictly **idempotent** (`CREATE TABLE IF NOT EXISTS`).
 
 ```sql
 CREATE TABLE IF NOT EXISTS news (
@@ -170,7 +170,7 @@ DELETE FROM news WHERE published_at < ?;
 
 ## 6. SQL Query Patterns Used in the Code
 
-### 6.1. Feed Query with Filters and Pagination ([`database.py:list_articles`](file:///home/nsm/Documents/githubREPO/last247DB/database.py#L225))
+### 6.1. Feed Query with Filters and Pagination ([`database.py:list_articles`](./database.py))
 ```sql
 -- 1. Get total count of matching articles
 SELECT COUNT(*) FROM news WHERE category = ? AND source = ?;
@@ -185,7 +185,7 @@ ORDER BY published_at DESC, id ASC
 LIMIT ? OFFSET ?;
 ```
 
-### 6.2. Single Article Lookup ([`database.py:get_article_by_id`](file:///home/nsm/Documents/githubREPO/last247DB/database.py#L274))
+### 6.2. Single Article Lookup ([`database.py:get_article_by_id`](./database.py))
 ```sql
 SELECT id, title, description, content, url, image_url, source, author, category,
        published_at, fetched_at, provider,
@@ -194,7 +194,7 @@ FROM news
 WHERE id = ?;
 ```
 
-### 6.3. System Statistics ([`database.py:count_articles`](file:///home/nsm/Documents/githubREPO/last247DB/database.py#L290))
+### 6.3. System Statistics ([`database.py:count_articles`](./database.py))
 ```sql
 SELECT COUNT(*) FROM news;
 ```
@@ -240,4 +240,4 @@ The `llm_*` columns are the database's interface to the LLM Brain. The LLMPing s
 1. **Clean input**: Deduplicated, normalized article rows (author/category/source standardized across providers) are the prompt payload.
 2. **Per-article parse**: Each run sends up to 7 articles, one at a time, with the configured system prompt (`LLM_SYSTEM_PROMPT`) plus the article data. The parsed reply is stored as received in `llm_answer` — the database remains the final persistent storage.
 3. **Provenance**: `llm_provider` and `llm_model` record which backend LLMPing used, and `llm_processed_at` records when.
-4. **Direct SQL Access**: The frontend (or any consumer) reads parsed results with a plain `SELECT title, llm_answer, llm_model FROM news WHERE llm_answer IS NOT NULL` — no extra API calls needed.
+4. **Read access**: Parsed results are exposed through the backend HTTP API (`GET /api/news` returns the `llm_*` fields on each article) — see [docs/UI_API.md](./docs/UI_API.md). The frontend never queries the database directly; SQL access is for operators/debugging only (see section 7).
