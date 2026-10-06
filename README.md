@@ -66,7 +66,7 @@ The system prompt is an instruction layer, kept in its own section — it is nev
 | `POST` | `/api/ingest` | Trigger a manual ingestion + LLM parse run. |
 | `GET` | `/api/stats` | Total article count and last ingestion result (incl. `parsed`/`parse_failed`). |
 
-See [docs/UI_API.md](./docs/UI_API.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
+See [UI_API.md](./UI_API.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
 
 ### Verified response samples (real, captured from the live service)
 
@@ -386,7 +386,7 @@ interface Article {
 
 The `llm_*` fields are `null`/absent until the article has been processed by the LLMPing phase.
 
-See [docs/UI_API.md](./docs/UI_API.md) for full details including `fetch()` examples.
+See [UI_API.md](./UI_API.md) for full details including `fetch()` examples.
 
 ---
 

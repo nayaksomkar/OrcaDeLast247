@@ -240,4 +240,4 @@ The `llm_*` columns are the database's interface to the LLM Brain. The LLMPing s
 1. **Clean input**: Deduplicated, normalized article rows (author/category/source standardized across providers) are the prompt payload.
 2. **Per-article parse**: Each run sends up to 7 articles, one at a time, with the configured system prompt (`LLM_SYSTEM_PROMPT`) plus the article data. The parsed reply is stored as received in `llm_answer` — the database remains the final persistent storage.
 3. **Provenance**: `llm_provider` and `llm_model` record which backend LLMPing used, and `llm_processed_at` records when.
-4. **Read access**: Parsed results are exposed through the backend HTTP API (`GET /api/news` returns the `llm_*` fields on each article) — see [docs/UI_API.md](./docs/UI_API.md). The frontend never queries the database directly; SQL access is for operators/debugging only (see section 7).
+4. **Read access**: Parsed results are exposed through the backend HTTP API (`GET /api/news` returns the `llm_*` fields on each article) — see [UI_API.md](./UI_API.md). The frontend never queries the database directly; SQL access is for operators/debugging only (see section 7).
