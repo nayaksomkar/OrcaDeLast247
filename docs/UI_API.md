@@ -230,9 +230,25 @@ interface Article {
   unparseable the backend stores "now" — the field is never missing.
 - Same URL re-ingested → same `id`, raw fields refreshed, `llm_*` fields
   preserved.
-- `llm_answer` is the LLM Brain reply stored as received — its inner structure
-  depends on the configured system prompt; do not assume a fixed schema inside
-  it.
+- `llm_answer` is stored as received from the LLM Brain. With the shipped
+  editorial prompt (`LLM_SYSTEM_PROMPT` in `.env`), it is a single strict JSON
+  object — verified live on 6/6 sample articles:
+
+  ```json
+  {
+    "title": "...",        // echoed from the article
+    "url": "...",          // echoed, matches the row's url
+    "source": "...",
+    "author": "...",
+    "category": "...",
+    "published_at": "...", // echoed
+    "summary": "2-3 sentence summary based only on the article",
+    "key_points": ["up to 3 short factual strings"]
+  }
+  ```
+
+  Treat it as best-effort (a different deployment prompt may change the
+  shape): try `JSON.parse` and fall back to rendering the raw text.
 - Articles older than `RETENTION_DAYS` (default 7) are deleted at the end of
   each run — a formerly valid `id` may legitimately become `404`.
 
