@@ -13,14 +13,17 @@ from config import Config, _parse_duration_seconds, _parse_positive_int, load_co
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """Remove all Last247 env vars before every config test."""
-    monkeypatch.setattr("config._default_env_file", None)
+    """Disable .env loading and remove all Last247 env vars before every config test."""
+    monkeypatch.setattr("config.load_dotenv", lambda *args, **kwargs: None)
     for key in [
         "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN", "PORT",
         "INGEST_INTERVAL", "INGEST_TIMEOUT", "RETENTION_DAYS",
         "NEWS_API_KEY", "GNEWS_API_KEY", "NEWS_DATA_API_KEY",
         "WEBFETCH_API_URL", "WEBFETCH_API_KEY",
         "NEWS_LANGUAGE", "MAX_ARTICLES", "CORS_ALLOW_ORIGINS",
+        "LLMPING_BASE_URL", "LLMPING_CHAT_PATH", "LLMPING_TIMEOUT",
+        "LLMPING_API_TOKEN", "LLM_SYSTEM_PROMPT", "LLM_MAX_CONTENT_CHARS",
+        "LLMPING_API_URL",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -41,12 +44,24 @@ def test_load_config_applies_defaults(monkeypatch):
     assert cfg.turso_url == "file:./test.db"
     assert cfg.turso_token == ""
     assert cfg.retention_days == 7
-    assert cfg.max_articles == 50
+    assert cfg.max_articles == 7
     assert cfg.language == "en"
     assert cfg.port == "8080"
-    assert cfg.ingest_interval == 21_600
-    assert cfg.ingest_timeout == 120
+    assert cfg.ingest_interval == 28_800          # 8h — 3 runs/day
+    assert cfg.ingest_timeout == 900              # covers 7 sequential LLM calls
     assert cfg.cors_origins == ["*"]
+
+
+def test_load_config_llmping_defaults(monkeypatch):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    cfg = load_config()
+
+    assert cfg.llmping_base_url == "https://llmping.onrender.com"
+    assert cfg.llmping_chat_path == "/chat"
+    assert cfg.llmping_timeout == 60
+    assert cfg.llmping_api_token == ""            # no auth header sent by default
+    assert cfg.system_prompt == ""                # placeholder prompt used
+    assert cfg.llm_max_content_chars == 4000
 
 
 def test_load_config_env_overrides_win(monkeypatch):
@@ -73,6 +88,27 @@ def test_load_config_env_overrides_win(monkeypatch):
     assert cfg.cors_origins == ["https://app.last247.dev", "https://other.dev"]
 
 
+def test_load_config_llmping_env_overrides_win(monkeypatch):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    monkeypatch.setenv("LLMPING_BASE_URL", "http://localhost:1234")
+    monkeypatch.setenv("LLMPING_CHAT_PATH", "/v1/chat")
+    monkeypatch.setenv("LLMPING_API_URL", "http://override.example.com/chat")
+    monkeypatch.setenv("LLMPING_TIMEOUT", "30s")
+    monkeypatch.setenv("LLMPING_API_TOKEN", "secret-token")
+    monkeypatch.setenv("LLM_SYSTEM_PROMPT", "You are a test prompt.")
+    monkeypatch.setenv("LLM_MAX_CONTENT_CHARS", "500")
+
+    cfg = load_config()
+
+    assert cfg.llmping_base_url == "http://localhost:1234"
+    assert cfg.llmping_chat_path == "/v1/chat"
+    assert cfg.llmping_api_url == "http://override.example.com/chat"
+    assert cfg.llmping_timeout == 30
+    assert cfg.llmping_api_token == "secret-token"
+    assert cfg.system_prompt == "You are a test prompt."
+    assert cfg.llm_max_content_chars == 500
+
+
 def test_load_config_ignores_invalid_numeric_values(monkeypatch):
     monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
     monkeypatch.setenv("RETENTION_DAYS", "not-a-number")
@@ -81,7 +117,7 @@ def test_load_config_ignores_invalid_numeric_values(monkeypatch):
     cfg = load_config()
     # Bad values → defaults stay in effect
     assert cfg.retention_days == 7
-    assert cfg.max_articles == 50
+    assert cfg.max_articles == 7
 
 
 def test_load_config_reads_provider_keys(monkeypatch):
@@ -111,7 +147,7 @@ def test_load_config_reads_provider_keys(monkeypatch):
     ("3600", 3600),
     ("",     999),     # empty → default
     ("bad",  999),     # invalid → default
-    ("0h",   999),     # zero → default
+    ("0h",   0),       # parseable → 0 (only parse failures fall back)
 ])
 def test_parse_duration_seconds(value, expected):
     assert _parse_duration_seconds(value, default=999) == expected

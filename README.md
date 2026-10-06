@@ -1,6 +1,8 @@
 # Last247 News API Service
 
-A Go HTTP microservice that fetches news from external providers (NewsAPI, GNews, NewsData.io, WebFetch), normalizes and deduplicates articles into a Turso database, and serves them via a JSON HTTP API for the Last247 Next.js frontend.
+A Python (FastAPI) HTTP service that fetches news from external providers (NewsAPI, GNews, NewsData.io, WebFetch), normalizes and deduplicates articles into a Turso database, parses each article with the external **LLMPing** LLM Brain, and serves the processed articles via a JSON HTTP API for the Last247 Next.js frontend.
+
+OrcaDeLast247 never runs a model itself. All inference happens in the external LLMPing service (`https://llmping.onrender.com`) — this project only orchestrates: fetch → store → send system prompt + article to LLMPing → store the parsed answer.
 
 ## Architecture
 
@@ -13,20 +15,24 @@ NewsData.io
    ↓ failure / empty?
 WebFetch API
    ↓
-Go Ingestion Service  (this repo — HTTP microservice)
-   ↓
-Turso `news` table
+Last247 Ingestion (this repo — FastAPI service)
+   ├─ normalize + dedup → Turso `news` table
+   ├─ per article (max 7/run): system prompt + article data
+   │        ↓ POST /chat
+   │    LLMPing LLM Brain (external — provider/model selection + inference)
+   │        ↓ parsed answer
+   └─ parsed answer stored on the article row (llm_* columns)
    ↓
 Next.js Frontend  (GET /api/news via this service's HTTP API)
    ↓
 Browser UI
 ```
 
-The service runs as a long-lived HTTP server. It ingests news on startup and then periodically (every 6 hours by default). The Next.js frontend queries this service's API to read stored articles — it never calls news providers directly.
+The service runs as a long-lived HTTP server. It ingests on startup and then every 8 hours (`INGEST_INTERVAL`). Each run: fetch ≤ `MAX_ARTICLES` (7) articles, store them, then send each one to LLMPing sequentially and persist the parsed answer. **3 runs/day × 7 articles = 21 LLM parse calls/day.** No queue, broker, or worker system — just the existing in-process scheduler.
 
-### Sequential fallback
+### Sequential provider fallback
 
-The service tries providers in order and stops on the first one that returns usable articles. It never calls all providers simultaneously — it only moves to the next provider when the previous one fails, times out, is rate-limited, or returns empty data.
+The service tries providers in order and stops on the first one that returns usable articles. It never calls all providers simultaneously.
 
 | Order | Provider    | Env var          | Endpoint                                |
 |-------|-------------|------------------|-----------------------------------------|
@@ -35,7 +41,18 @@ The service tries providers in order and stops on the first one that returns usa
 | 3     | NewsData.io | `NEWS_DATA_API_KEY` | `https://newsdata.io/api/1/news`     |
 | 4     | WebFetch    | `WEBFETCH_API_URL` + `WEBFETCH_API_KEY` | configurable              |
 
-A provider is only attempted if it has the required API key (or, for WebFetch, its base URL). If a provider returns an error, an HTTP non-2xx status, or zero articles, the service moves to the next one.
+A provider is only attempted if it has the required API key (or, for WebFetch, its base URL). If a provider errors, returns non-2xx, or zero articles, the next one is tried.
+
+### LLMPing parse phase (per article)
+
+After the upsert loop, each stored article is processed **sequentially**:
+
+1. Build the prompt: `=== SYSTEM INSTRUCTIONS ===` (from `LLM_SYSTEM_PROMPT`, or the built-in placeholder) + `=== ARTICLE DATA ===` (title/url/source/author/category/published_at/description/content from the stored `Article`).
+2. `POST {LLMPING_BASE_URL}{LLMPING_CHAT_PATH}` with `{"query": prompt}`.
+3. Store `answer` (as received) plus the reported `provider`/`model` on the article row (`llm_answer`, `llm_provider`, `llm_model`, `llm_processed_at`).
+4. A failed call is logged and skipped — the article stays stored with `llm_answer = NULL` and the run continues to the next article. Nothing is fabricated.
+
+The system prompt is an instruction layer, kept in its own section — it is never mixed into article content. The final editorial prompt is supplied via the `LLM_SYSTEM_PROMPT` env var; the in-code default is a clearly marked placeholder.
 
 ---
 
@@ -43,11 +60,11 @@ A provider is only attempted if it has the required API key (or, for WebFetch, i
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/health` | Health liveness/readiness check. |
-| `GET` | `/api/news` | Paginated list of articles with optional `category` and `source` filters. |
+| `GET` | `/health` | Health liveness check. |
+| `GET` | `/api/news` | Paginated list of articles (with optional `category`/`source` filters). Includes the LLM parse fields when available. |
 | `GET` | `/api/news/{id}` | Get a single article by its deterministic ID. |
-| `POST` | `/api/ingest` | Trigger a manual ingestion run. |
-| `GET` | `/api/stats` | Get total article count and last ingestion result. |
+| `POST` | `/api/ingest` | Trigger a manual ingestion + LLM parse run. |
+| `GET` | `/api/stats` | Total article count and last ingestion result (incl. `parsed`/`parse_failed`). |
 
 See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full endpoint documentation, request/response schemas, and `fetch()` examples.
 
@@ -57,23 +74,30 @@ See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full endpoint documenta
 
 ```sql
 CREATE TABLE IF NOT EXISTS news (
-    id           TEXT PRIMARY KEY,       -- stable SHA-256 hash of the URL (16 hex chars)
-    title        TEXT NOT NULL,
-    description  TEXT,
-    content      TEXT,
-    url          TEXT NOT NULL UNIQUE,   -- UNIQUE prevents duplicate stories
-    image_url    TEXT,
-    source       TEXT,
-    author       TEXT,
-    category     TEXT,
-    published_at TEXT NOT NULL,          -- ISO 8601 (UTC RFC 3339)
-    fetched_at   TEXT NOT NULL,          -- ISO 8601 (UTC RFC 3339)
-    provider     TEXT
+    id               TEXT PRIMARY KEY,  -- stable SHA-256 hash of the URL (16 hex chars)
+    title            TEXT NOT NULL,
+    description      TEXT,
+    content          TEXT,
+    url              TEXT NOT NULL UNIQUE,  -- UNIQUE prevents duplicate stories
+    image_url        TEXT,
+    source           TEXT,
+    author           TEXT,
+    category         TEXT,
+    published_at     TEXT NOT NULL,     -- ISO 8601 (UTC RFC 3339)
+    fetched_at       TEXT NOT NULL,     -- ISO 8601 (UTC RFC 3339)
+    provider         TEXT,
+    -- LLM parse result (nullable until the article has been processed)
+    llm_answer       TEXT,              -- parsed answer from the LLM Brain, as received
+    llm_provider     TEXT,              -- LLMPing-reported provider used for the parse
+    llm_model        TEXT,              -- LLMPing-reported model used for the parse
+    llm_processed_at TEXT               -- ISO 8601 UTC, when the parse was stored
 );
 
 CREATE INDEX IF NOT EXISTS idx_news_published_at ON news (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_url          ON news (url);
 ```
+
+Existing databases get the four `llm_*` columns transparently — `init_db()` runs an idempotent `ALTER TABLE ADD COLUMN` on every startup. `upsert_article()` never touches the `llm_*` columns, so re-ingesting the same URL cannot wipe a stored parse.
 
 ### Seven-day retention
 
@@ -81,16 +105,16 @@ Each ingestion run deletes articles whose `published_at` is older than `RETENTIO
 
 ### Deduplication
 
-The `url` column has a `UNIQUE` constraint. When the same story appears again, `ON CONFLICT(url) DO UPDATE` refreshes the stored fields instead of inserting a duplicate. The `id` column is a deterministic SHA-256 hash of the URL.
+The `url` column has a `UNIQUE` constraint. When the same story appears again, `ON CONFLICT(url) DO UPDATE` refreshes the stored raw fields instead of inserting a duplicate. The `id` column is a deterministic SHA-256 hash of the URL.
 
 ---
 
 ## Prerequisites
 
-- **Go 1.26+** (the module declares `go 1.26.0`; the toolchain auto-downloads if needed). Run `go version` to check.
-- **Docker** (optional, for containerized deployment).
+- **Python 3.11+** (`python --version`).
 - A **Turso database** (remote or local file). For local development, use `file:./news.db`.
 - At least one **news provider API key** for ingestion to fetch anything.
+- The **LLMPing service** must be reachable (defaults to `https://llmping.onrender.com`).
 
 ---
 
@@ -101,8 +125,8 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 | `TURSO_DATABASE_URL` | **Yes** | — | Turso connection string (`libsql://name.turso.io`) or local file (`file:./news.db`). |
 | `TURSO_AUTH_TOKEN` | Remote only | `""` | Turso auth token. Leave empty for local files. |
 | `PORT` | No | `8080` | HTTP listen port. Render provides this dynamically. |
-| `INGEST_INTERVAL` | No | `6h` | Background ingestion cadence. |
-| `INGEST_TIMEOUT` | No | `120s` | Max duration for one ingestion run. |
+| `INGEST_INTERVAL` | No | `8h` | Background ingestion cadence (3 runs/day). |
+| `INGEST_TIMEOUT` | No | `900s` | Max duration for one run — must cover the fetch plus up to 7 sequential LLMPing calls. |
 | `RETENTION_DAYS` | No | `7` | Rolling retention window in days. |
 | `NEWS_API_KEY` | One of four | `""` | NewsAPI key (provider #1). |
 | `GNEWS_API_KEY` | One of four | `""` | GNews key (provider #2). |
@@ -110,8 +134,16 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 | `WEBFETCH_API_URL` | One of four | `""` | WebFetch base URL (provider #4). |
 | `WEBFETCH_API_KEY` | Conditional | `""` | WebFetch API key (optional). |
 | `NEWS_LANGUAGE` | No | `en` | Article language filter. |
-| `MAX_ARTICLES` | No | `50` | Max articles per provider per run. |
+| `MAX_ARTICLES` | No | `7` | Max articles fetched (and LLM-parsed) per run. |
 | `CORS_ALLOW_ORIGINS` | No | `*` | Comma-separated allowed CORS origins. |
+| `LLMPING_BASE_URL` | No | `https://llmping.onrender.com` | LLMPing service base URL. |
+| `LLMPING_CHAT_PATH` | No | `/chat` | Chat endpoint path appended to the base URL. |
+| `LLMPING_TIMEOUT` | No | `60s` | Max duration of one LLMPing `/chat` call. |
+| `LLMPING_API_TOKEN` | No | `""` | Optional Bearer token — sent only when set (LLMPing currently requires none). |
+| `LLM_SYSTEM_PROMPT` | No | (placeholder) | System instructions sent with every article. The final editorial prompt goes here. |
+| `LLM_MAX_CONTENT_CHARS` | No | `4000` | Max characters of description/content included in a prompt. |
+
+Do not put secrets in source files — use `.env` (gitignored) or the platform's env-var UI.
 
 ---
 
@@ -120,35 +152,28 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 ### Setup
 
 ```bash
-# 1. Initialize / download dependencies
-go mod download
+# 1. Install dependencies — either with uv (creates/updates .venv, respects uv.lock):
+uv sync
+#    ...or plain pip:
+pip install -r requirements.txt
 
 # 2. Configure environment
 cp .env.example .env
 # Then edit .env:
 #   TURSO_DATABASE_URL=file:./news.db      # local SQLite file
 #   NEWS_API_KEY=your-key                  # at least one provider key
-#   # optional: GNEWS_API_KEY, NEWS_DATA_API_KEY, WEBFETCH_API_URL
+#   LLM_SYSTEM_PROMPT=...                  # optional: the real editorial prompt
 ```
 
 ### Running
 
 ```bash
-# Run the HTTP server (default port 8080)
-go run .
+# Run the HTTP server (default port 8080; ingests immediately, then every 8h)
+python main.py
 
-# Run with custom port
-PORT=9090 go run .
-
-# Build a binary
-go build -o last247 .
-./last247
+# or with uv (uses the project .venv):
+uv run python main.py
 ```
-
-Once running, the server:
-- Starts an initial ingestion run on startup.
-- Serves HTTP on `0.0.0.0:<PORT>`.
-- Runs subsequent ingestion runs every `INGEST_INTERVAL` (default 6h).
 
 ### Available endpoints (local)
 
@@ -163,17 +188,20 @@ GET  http://localhost:8080/api/stats
 ### Running tests
 
 ```bash
-# Full suite (root package + providers), race detector on
-go test -race -shuffle=on -count=1 ./...
-
-# Verbose output with per-test names
-go test -v -count=1 ./...
-
-# Coverage report
-go test -coverprofile=cover.out ./... && go tool cover -func=cover.out
+# Full suite — self-contained: in-memory SQLite + respx/httpx mocks,
+# no network access and no real API keys required
+uv run pytest
+# (or: pytest -v with a pip-installed environment)
 ```
 
-The suite is self-contained: it uses throwaway SQLite files (`t.TempDir()`) and `httptest` fakes for provider HTTP endpoints — no network access and no real provider API keys required.
+### Live verification scripts (hit the real services)
+
+```bash
+uv run python scripts/test_providers_live.py   # one small real request per configured provider
+uv run python scripts/test_turso_live.py       # Turso write/read/dedup/retention lifecycle
+uv run python scripts/test_llmping_live.py     # {"query": "Hello"} + one real article prompt
+TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=7 uv run python scripts/test_one_cycle_live.py
+```
 
 ---
 
@@ -184,10 +212,6 @@ The suite is self-contained: it uses throwaway SQLite files (`t.TempDir()`) and 
 ```bash
 docker build -t last247 .
 ```
-
-The Dockerfile uses a multi-stage build:
-- **Builder stage**: `golang:1.26-alpine` — compiles a static binary with `CGO_ENABLED=0`.
-- **Runtime stage**: `alpine:3.20` — runs the binary with just `ca-certificates`.
 
 ### Run
 
@@ -201,82 +225,27 @@ docker run -d \
   last247
 ```
 
-For a remote Turso database:
-
-```bash
-docker run -d \
-  -p 8080:8080 \
-  -e TURSO_DATABASE_URL=libsql://your-db.turso.io \
-  -e TURSO_AUTH_TOKEN=your-token \
-  -e NEWS_API_KEY=your-key \
-  --name last247 \
-  last247
-```
+For a remote Turso database, add `-e TURSO_AUTH_TOKEN=your-token` and use the `libsql://` URL.
 
 ### Docker Compose (optional)
 
-```yaml
-# docker-compose.yml
-version: "3.8"
-services:
-  api:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - TURSO_DATABASE_URL=file:./news.db
-      - REDIS_URL=redis://redis:6379
-      - CORS_ALLOW_ORIGINS=http://localhost:3000
-    volumes:
-      - news-data:/app
-    depends_on:
-      - redis
-
-volumes:
-  news-data:
+```bash
+docker compose up -d
 ```
+
+`docker-compose.yml` starts the single `api` service with the env vars from `.env`.
 
 ---
 
 ## Render Deployment
 
-### `render.yaml`
-
-```yaml
-services:
-  - type: web
-    name: last247-api
-    runtime: docker
-    plan: free
-    dockerfilePath: ./Dockerfile
-    healthCheckPath: /health
-    envVars:
-      - key: TURSO_DATABASE_URL
-        value: libsql://your-db.turso.io
-      - key: TURSO_AUTH_TOKEN
-        value: your-token
-      - key: NEWS_API_KEY
-        value: your-key
-      # optional: GNEWS_API_KEY, NEWS_DATA_API_KEY, WEBFETCH_API_URL, WEBFETCH_API_KEY
-      - key: CORS_ALLOW_ORIGINS
-        value: https://your-frontend.vercel.app
-      - key: INGEST_INTERVAL
-        value: 6h
-      - key: RETENTION_DAYS
-        value: 7
-```
-
-### Manual Render setup
-
 1. **Create a Web Service** on [render.com](https://render.com).
-2. **Environment**: Docker.
-3. **Build Command**: `docker build -t last247 .`
-4. **Start Command**: Leave empty (the Dockerfile's `CMD` handles it).
-5. **Health Check Path**: `/health`
-6. **Port**: Render sets `PORT` automatically — the service reads it from the environment.
-7. Add the environment variables listed above under **Environment → Environment Variables**.
+2. **Environment**: Docker (the repo's `Dockerfile` builds the Python image).
+3. **Health Check Path**: `/health`
+4. **Port**: Render sets `PORT` automatically — the service reads it from the environment.
+5. Add the environment variables listed above under **Environment → Environment Variables** (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, a news provider key, and optionally `LLM_SYSTEM_PROMPT`).
 
-Render provides the `PORT` environment variable automatically. The service binds to `0.0.0.0:<PORT>`, which is required for Render's container networking.
+Render provides `PORT` automatically. The service binds to `0.0.0.0:<PORT>`, which is required for Render's container networking.
 
 ### Deploy via GitHub
 
@@ -288,13 +257,13 @@ Render provides the `PORT` environment variable automatically. The service binds
 
 ## Data Contract
 
-The `Article` struct (`article.go`) is the canonical data shape for all API responses. It matches the `news` table columns exactly:
+The `Article` model (`models.py`) is the canonical data shape for all API responses. It matches the `news` table columns exactly:
 
 ```typescript
 interface Article {
   id: string;            // 16-char hex, SHA-256(URL)[:16], deterministic
   title: string;         // always present, non-empty
-  description?: string;  // may be absent (empty → omitted by omitempty)
+  description?: string;  // may be absent
   content?: string;      // may be absent
   url: string;           // always present, non-empty, UNIQUE
   image_url?: string;    // may be absent
@@ -302,10 +271,16 @@ interface Article {
   author?: string;       // may be absent
   category?: string;     // single category, may be absent
   published_at: string;  // ISO 8601 / RFC 3339, UTC, always present
-  fetched_at: string;   // ISO 8601 / RFC 3339, UTC, always present
-  provider: string;     // "newsapi" | "gnews" | "newsdata" | "webfetch"
+  fetched_at: string;    // ISO 8601 / RFC 3339, UTC, always present
+  provider: string;      // "newsapi" | "gnews" | "newsdata" | "webfetch"
+  llm_answer?: string;   // parsed answer from the LLM Brain, as received
+  llm_provider?: string; // provider LLMPing used for the parse
+  llm_model?: string;    // model LLMPing used for the parse
+  llm_processed_at?: string; // ISO 8601 UTC — when the parse was stored
 }
 ```
+
+The `llm_*` fields are `null`/absent until the article has been processed by the LLMPing phase.
 
 See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full details including `fetch()` examples.
 
@@ -313,8 +288,8 @@ See [UI_API_INTEGRATION.md](./UI_API_INTEGRATION.md) for full details including 
 
 ## Production Notes
 
-- The service is **stateless** beyond the database connection. Multiple instances can run behind a load balancer — each will independently attempt ingestion (idempotent due to `ON CONFLICT` dedup).
-- The `/health` endpoint does not depend on the database — it checks process liveness only. A 200 from `/health` means the HTTP server is running, not that the database is reachable.
+- The service is **stateless** beyond the database connection. Multiple instances can run behind a load balancer — each will independently attempt ingestion (idempotent due to `ON CONFLICT` dedup and the `UPDATE`-based parse store).
+- The `/health` endpoint does not depend on the database — it checks process liveness only.
 - No authentication is implemented. For production, place behind a reverse proxy (e.g., Cloudflare, Nginx) or Render's built-in networking controls.
-- No background workers, queues, or AI functionality are used. Ingestion runs in-process via a `time.Ticker`.
-- The binary is ~12 MB (stripped, CGO_ENABLED=0). Docker image is ~12 MB total.
+- Ingestion runs in-process via an `asyncio` background task (`INGEST_INTERVAL`). Per-article LLM failures never abort a run; failed articles simply remain un-parsed until the next run refreshes them.
+- Workload is bounded by design: 3 runs/day × 7 articles = 21 LLMPing calls/day.

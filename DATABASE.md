@@ -26,9 +26,15 @@ The Last247 database acts as the **single source of truth** for all news article
           │  - Indexed by published_at DESC   │
           └─────────────────┬─────────────────┘
                             │
-                            │ SELECT queries (ORDER BY published_at DESC)
+                            │ per article (max 7/run, sequential):
+                            │ system prompt + article data
                             ▼
-               [ FastAPI Endpoints (/api/news) ]
+          [ LLMPing LLM Brain — POST /chat (external) ]
+                            │
+                            │ parsed answer stored via
+                            │ save_llm_parse → llm_* columns
+                            ▼
+                 [ FastAPI Endpoints (/api/news) ]
                             │
                             ▼
                  [ Next.js Frontend UI ]
@@ -49,23 +55,31 @@ The schema is created automatically on application startup via `init_db()` in [`
 
 ```sql
 CREATE TABLE IF NOT EXISTS news (
-    id           TEXT PRIMARY KEY,       -- Deterministic 16-hex SHA-256 hash of URL
-    title        TEXT NOT NULL,          -- Article title / headline
-    description  TEXT,                   -- Short summary / subtitle (nullable)
-    content      TEXT,                   -- Full article body text (nullable)
-    url          TEXT NOT NULL UNIQUE,   -- Canonical URL & deduplication key
-    image_url    TEXT,                   -- Hero image URL (nullable)
-    source       TEXT,                   -- Publisher name (e.g., "BBC News")
-    author       TEXT,                   -- Author name or joined list (nullable)
-    category     TEXT,                   -- Primary category (e.g., "technology")
-    published_at TEXT NOT NULL,          -- ISO 8601 UTC timestamp
-    fetched_at   TEXT NOT NULL,          -- ISO 8601 UTC timestamp of ingestion
-    provider     TEXT                    -- Ingestion provider ("newsapi", etc.)
+    id               TEXT PRIMARY KEY,  -- Deterministic 16-hex SHA-256 hash of URL
+    title            TEXT NOT NULL,     -- Article title / headline
+    description      TEXT,              -- Short summary / subtitle (nullable)
+    content          TEXT,              -- Full article body text (nullable)
+    url              TEXT NOT NULL UNIQUE, -- Canonical URL & deduplication key
+    image_url        TEXT,              -- Hero image URL (nullable)
+    source           TEXT,              -- Publisher name (e.g., "BBC News")
+    author           TEXT,              -- Author name or joined list (nullable)
+    category         TEXT,              -- Primary category (e.g., "technology")
+    published_at     TEXT NOT NULL,     -- ISO 8601 UTC timestamp
+    fetched_at       TEXT NOT NULL,     -- ISO 8601 UTC timestamp of ingestion
+    provider         TEXT,              -- Ingestion provider ("newsapi", etc.)
+    llm_answer       TEXT,              -- Parsed answer from the LLMPing LLM Brain (nullable)
+    llm_provider     TEXT,              -- LLMPing-reported provider used for the parse (nullable)
+    llm_model        TEXT,              -- LLMPing-reported model used for the parse (nullable)
+    llm_processed_at TEXT               -- ISO 8601 UTC, when the parse was stored (nullable)
 );
 
 CREATE INDEX IF NOT EXISTS idx_news_published_at ON news (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_url          ON news (url);
 ```
+
+### Migration for the LLM parse columns
+
+Databases created before the LLMPing phase are migrated transparently: on every startup `init_db()` runs an idempotent `ALTER TABLE news ADD COLUMN ...` for each of the four `llm_*` columns (skipped when the column already exists). No data is touched.
 
 ---
 
@@ -85,6 +99,10 @@ CREATE INDEX IF NOT EXISTS idx_news_url          ON news (url);
 | `published_at` | `TEXT` | `NOT NULL` | Original publication date/time in UTC ISO 8601 format (`YYYY-MM-DDTHH:MM:SS.fZ`). |
 | `fetched_at` | `TEXT` | `NOT NULL` | UTC ISO 8601 timestamp recording when the ingestion service stored or refreshed the row. |
 | `provider` | `TEXT` | `NULL` | Provider identifier that supplied the article (`newsapi`, `gnews`, `newsdata`, `webfetch`). |
+| `llm_answer` | `TEXT` | `NULL` | Parsed/structured result produced by the LLMPing LLM Brain for this article, stored exactly as received. `NULL` until processed. Written only by `save_llm_parse()`. |
+| `llm_provider` | `TEXT` | `NULL` | Provider LLMPing reports using for the parse (LLMPing owns provider/model selection). |
+| `llm_model` | `TEXT` | `NULL` | Model LLMPing reports using for the parse. |
+| `llm_processed_at` | `TEXT` | `NULL` | UTC ISO 8601 timestamp of when the parse result was stored. |
 
 ---
 
@@ -128,8 +146,19 @@ ON CONFLICT(url) DO UPDATE SET
     provider     = excluded.provider;
 ```
 - **Outcome**: The existing row is updated in-place with fresher metadata, preventing duplicate cards from ever appearing in the UI.
+- **LLM parse safety**: The upsert column list deliberately excludes the `llm_*` columns, so re-ingesting the same URL can never erase a stored parse. The parse phase re-writes them after each run's `save_llm_parse()` call.
 
-### 5.3. Rolling 7-Day Retention Sweep
+### 5.3. LLM Parse Store (`save_llm_parse`)
+After the upsert loop, each stored article (max `MAX_ARTICLES` = 7 per run) is sent to the LLMPing LLM Brain and the parsed answer is persisted on the row:
+```sql
+UPDATE news
+SET llm_answer = ?, llm_provider = ?, llm_model = ?, llm_processed_at = ?
+WHERE id = ?;
+```
+- Only the `llm_*` columns are touched — the raw article data written by the upsert is never modified.
+- A failed LLMPing call is logged and skipped: the row keeps `llm_answer = NULL` and the run moves to the next article. Nothing is fabricated.
+
+### 5.4. Rolling 7-Day Retention Sweep
 To keep the database lean and performant, every ingestion run automatically sweeps expired records at the end of its cycle:
 ```sql
 DELETE FROM news WHERE published_at < ?;
@@ -147,7 +176,9 @@ DELETE FROM news WHERE published_at < ?;
 SELECT COUNT(*) FROM news WHERE category = ? AND source = ?;
 
 -- 2. Fetch paginated slice (newest first, id ASC as stable tiebreaker)
-SELECT id, title, description, content, url, image_url, source, author, category, published_at, fetched_at, provider
+SELECT id, title, description, content, url, image_url, source, author, category,
+       published_at, fetched_at, provider,
+       llm_answer, llm_provider, llm_model, llm_processed_at
 FROM news
 WHERE category = ? AND source = ?
 ORDER BY published_at DESC, id ASC
@@ -156,7 +187,9 @@ LIMIT ? OFFSET ?;
 
 ### 6.2. Single Article Lookup ([`database.py:get_article_by_id`](file:///home/nsm/Documents/githubREPO/last247DB/database.py#L274))
 ```sql
-SELECT id, title, description, content, url, image_url, source, author, category, published_at, fetched_at, provider
+SELECT id, title, description, content, url, image_url, source, author, category,
+       published_at, fetched_at, provider,
+       llm_answer, llm_provider, llm_model, llm_processed_at
 FROM news
 WHERE id = ?;
 ```
@@ -182,6 +215,9 @@ sqlite> .schema news
 sqlite> SELECT COUNT(*) FROM news;
 sqlite> SELECT id, title, source, published_at FROM news ORDER BY published_at DESC LIMIT 5;
 sqlite> SELECT provider, COUNT(*) FROM news GROUP BY provider;
+-- LLM parse coverage (articles still missing a parsed result):
+sqlite> SELECT COUNT(*) FROM news WHERE llm_answer IS NULL;
+sqlite> SELECT title, llm_provider, llm_model, llm_processed_at FROM news WHERE llm_answer IS NOT NULL LIMIT 5;
 ```
 
 ### Remote Turso Cloud Database
@@ -197,9 +233,11 @@ turso> SELECT COUNT(*) FROM news;
 
 ---
 
-## 8. Integration with Future LLM / Brain
+## 8. Integration with the LLM Brain (LLMPing)
 
-The database schema has been intentionally designed to feed downstream AI summarizers or LLM Brain workflows:
-1. **Deduplicated & Clean**: No duplicate links or redundant headlines.
-2. **Normalized Metadata**: Author, category, and source are standardized regardless of whether the source was NewsAPI, GNews, or NewsData.io.
-3. **Direct SQL Access**: An LLM agent can query the database directly using `SELECT title, description, content FROM news WHERE published_at >= ...` without needing external API credentials.
+The `llm_*` columns are the database's interface to the LLM Brain. The LLMPing service (external, `https://llmping.onrender.com`) does the actual inference — OrcaDeLast247 only orchestrates:
+
+1. **Clean input**: Deduplicated, normalized article rows (author/category/source standardized across providers) are the prompt payload.
+2. **Per-article parse**: Each run sends up to 7 articles, one at a time, with the configured system prompt (`LLM_SYSTEM_PROMPT`) plus the article data. The parsed reply is stored as received in `llm_answer` — the database remains the final persistent storage.
+3. **Provenance**: `llm_provider` and `llm_model` record which backend LLMPing used, and `llm_processed_at` records when.
+4. **Direct SQL Access**: The frontend (or any consumer) reads parsed results with a plain `SELECT title, llm_answer, llm_model FROM news WHERE llm_answer IS NOT NULL` — no extra API calls needed.

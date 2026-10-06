@@ -1,10 +1,17 @@
 # Environment
 .env
 .env.local
+*.env
+# Credential files must never be committed (read via environment only).
+*.pem
+.creds/
 
-# Local databases
+# Local databases (runtime artifacts, not source)
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+db-data/
 
 # Built binaries
 /bin/

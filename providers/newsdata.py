@@ -50,14 +50,15 @@ class NewsDataIO(Provider):
 
         Auth is via the 'apikey' query parameter (note lowercase 'k').
         The 'language' param filters by language code.
-        NewsData.io does not support a 'from' date filter in the free tier,
-        so we pass it as 'from_date' and silently accept if ignored.
+
+        The 'from_date' parameter is PAID-plan-only on NewsData.io — the
+        free tier answers HTTP 422 when it is sent (verified live). The API
+        already returns the newest articles; cross-run overlap is handled by
+        DB URL dedup, so no date filter is needed.
         """
         params: dict[str, str] = {
             "apikey": api_key,
             "language": lang,
-            # from_date limits to articles published after this date.
-            "from_date": from_time.strftime("%Y-%m-%d"),
         }
 
         data = await fetch_json(self._base_url, params=params)

@@ -33,6 +33,14 @@ class Article(BaseModel):
     published_at: UTC datetime of original publication.
     fetched_at  : UTC datetime when this service stored the row.
     provider    : "newsapi" | "gnews" | "newsdata" | "webfetch"
+
+    LLM parse result (filled by the ingestion LLM phase via LLMPing):
+    llm_answer       : the parsed/structured answer returned by the LLM Brain,
+                       stored as received. None until the article has been
+                       processed.
+    llm_provider     : LLMPing-reported provider used for the parse.
+    llm_model        : LLMPing-reported model used for the parse.
+    llm_processed_at : ISO 8601 UTC timestamp of when the parse was stored.
     """
 
     model_config = ConfigDict(
@@ -53,6 +61,10 @@ class Article(BaseModel):
     published_at: datetime
     fetched_at: datetime
     provider: str
+    llm_answer: Optional[str] = Field(default=None)
+    llm_provider: Optional[str] = Field(default=None)
+    llm_model: Optional[str] = Field(default=None)
+    llm_processed_at: Optional[str] = Field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +82,9 @@ class IngestionResult:
     inserted   : rows actually upserted into the DB.
     skipped    : articles dropped (no title/URL, in-run dupe, or DB error).
     deleted    : stale articles removed by the retention sweep at run end.
+    parsed     : articles successfully processed by the LLM Brain (LLMPing) this run.
+    parse_failed: articles whose LLM parse failed (upstream error/timeout) — the
+                 article row remains stored with llm_answer=None.
     source_time: ISO 8601 UTC timestamp of when the provider was queried.
     """
 
@@ -78,6 +93,8 @@ class IngestionResult:
     inserted: int = 0
     skipped: int = 0
     deleted: int = 0
+    parsed: int = 0
+    parse_failed: int = 0
     source_time: str = field(
         default_factory=lambda: datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     )
@@ -89,5 +106,7 @@ class IngestionResult:
             "inserted": self.inserted,
             "skipped": self.skipped,
             "deleted": self.deleted,
+            "parsed": self.parsed,
+            "parse_failed": self.parse_failed,
             "source_time": self.source_time,
         }

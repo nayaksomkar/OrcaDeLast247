@@ -12,6 +12,8 @@ Optional (all have sensible defaults):
     TURSO_AUTH_TOKEN    PORT  INGEST_INTERVAL  INGEST_TIMEOUT  RETENTION_DAYS
     NEWS_API_KEY  GNEWS_API_KEY  NEWS_DATA_API_KEY  WEBFETCH_API_URL
     WEBFETCH_API_KEY  NEWS_LANGUAGE  MAX_ARTICLES  CORS_ALLOW_ORIGINS
+    LLMPING_BASE_URL  LLMPING_CHAT_PATH  LLMPING_TIMEOUT  LLMPING_API_TOKEN
+    LLM_SYSTEM_PROMPT  LLM_MAX_CONTENT_CHARS
 
 Usage:
     from config import load_config
@@ -49,16 +51,31 @@ class Config:
     Fetch options
     -------------
     language     : BCP 47 language tag used by provider queries (default "en").
-    max_articles : Max articles requested per provider per run (default 50).
+    max_articles : Max articles requested per provider per run (default 7).
 
     HTTP server
     -----------
     port             : TCP port the server listens on (default "8080").
                        Render provides PORT dynamically.
-    ingest_interval  : Seconds between background ingestion runs (default 21600 = 6h).
-    ingest_timeout   : Max seconds for one ingestion run (default 120).
+    ingest_interval  : Seconds between background ingestion runs (default 28800 = 8h).
+    ingest_timeout   : Max seconds for one ingestion run, including the per-article
+                       LLM parse phase (default 900).
     cors_origins     : List of allowed CORS origins (default ["*"] = allow all).
     retention_days   : Rolling article window in days; older rows are deleted (default 7).
+
+    LLMPing (LLM Brain)
+    -------------------
+    llmping_base_url : Base URL of the LLMPing service (default https://llmping.onrender.com).
+    llmping_chat_path: Path of the chat endpoint appended to the base URL (default "/chat").
+    llmping_api_url  : Optional FULL endpoint URL (e.g. https://llmping.onrender.com/chat).
+                       When set it overrides base_url + chat_path.
+    llmping_timeout  : Max seconds per LLMPing /chat call (default 60).
+    llmping_api_token: Bearer token for LLMPing. Empty by default — no auth header
+                       is sent unless this is set.
+    system_prompt    : System instructions sent with every article. Empty by default;
+                       the placeholder in llmping.DEFAULT_SYSTEM_PROMPT is used instead.
+    llm_max_content_chars : Max characters of article description/content included
+                       in a prompt (default 4000).
     """
 
     # Database
@@ -75,13 +92,22 @@ class Config:
 
     # Fetch options
     language: str = "en"
-    max_articles: int = 50
+    max_articles: int = 7
 
     # HTTP server
     port: str = "8080"
-    ingest_interval: int = 21_600   # seconds (6 h)
-    ingest_timeout: int = 120       # seconds
+    ingest_interval: int = 28_800   # seconds (8 h — 3 runs/day)
+    ingest_timeout: int = 900       # seconds, covers fetch + 7 sequential LLM calls
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+
+    # LLMPing (LLM Brain)
+    llmping_base_url: str = "https://llmping.onrender.com"
+    llmping_chat_path: str = "/chat"
+    llmping_api_url: str = ""       # full-URL override; empty = build from base+path
+    llmping_timeout: int = 60
+    llmping_api_token: str = ""
+    system_prompt: str = ""
+    llm_max_content_chars: int = 4000
 
 
 def load_config() -> Config:
@@ -116,7 +142,7 @@ def load_config() -> Config:
 
     # Fetch options.
     cfg.language     = os.getenv("NEWS_LANGUAGE", "en").strip() or "en"
-    cfg.max_articles = _parse_positive_int(os.getenv("MAX_ARTICLES", ""), 50)
+    cfg.max_articles = _parse_positive_int(os.getenv("MAX_ARTICLES", ""), 7)
 
     # Retention window.
     cfg.retention_days = _parse_positive_int(os.getenv("RETENTION_DAYS", ""), 7)
@@ -124,12 +150,28 @@ def load_config() -> Config:
     # HTTP server.
     cfg.port = os.getenv("PORT", "8080").strip() or "8080"
 
-    # Ingest interval: accept "6h", "30m", "3600s", or plain seconds integer.
+    # Ingest interval: accept "8h", "30m", "3600s", or plain seconds integer.
     cfg.ingest_interval = _parse_duration_seconds(
-        os.getenv("INGEST_INTERVAL", ""), default=21_600
+        os.getenv("INGEST_INTERVAL", ""), default=28_800
     )
+    # Run timeout must cover the fetch plus up to 7 sequential LLM parse calls.
     cfg.ingest_timeout = _parse_duration_seconds(
-        os.getenv("INGEST_TIMEOUT", ""), default=120
+        os.getenv("INGEST_TIMEOUT", ""), default=900
+    )
+
+    # LLMPing (LLM Brain) options.
+    cfg.llmping_base_url = (
+        os.getenv("LLMPING_BASE_URL", "").strip() or "https://llmping.onrender.com"
+    )
+    cfg.llmping_chat_path = os.getenv("LLMPING_CHAT_PATH", "").strip() or "/chat"
+    cfg.llmping_api_url   = os.getenv("LLMPING_API_URL", "").strip()
+    cfg.llmping_timeout   = _parse_duration_seconds(os.getenv("LLMPING_TIMEOUT", ""), 60)
+    cfg.llmping_api_token = os.getenv("LLMPING_API_TOKEN", "").strip()
+
+    # System prompt: empty means llmping.DEFAULT_SYSTEM_PROMPT (placeholder) is used.
+    cfg.system_prompt = os.getenv("LLM_SYSTEM_PROMPT", "").strip()
+    cfg.llm_max_content_chars = _parse_positive_int(
+        os.getenv("LLM_MAX_CONTENT_CHARS", ""), 4000
     )
 
     # CORS origins: comma-separated list, e.g. "https://app.last247.dev,https://..."

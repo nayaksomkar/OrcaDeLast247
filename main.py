@@ -10,7 +10,9 @@ POST /api/ingest        — trigger a manual ingestion run
 GET  /api/stats         — total article count + last ingestion summary
 
 The server also runs background ingestion on startup and every INGEST_INTERVAL
-seconds (default 6 h) using an asyncio background task.
+seconds (default 8 h = 3 runs/day) using an asyncio background task. Each run:
+fetch up to MAX_ARTICLES (7) articles → store → send each article + the system
+prompt to the LLMPing LLM Brain → store the parsed answer on the row.
 
 Run locally:
     python -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -113,9 +115,12 @@ def _log_ingestion_result(r: IngestionResult) -> None:
         "Inserted:   %d articles\n"
         "Skipped:    %d articles\n"
         "Deleted:    %d stale articles\n"
+        "LLM Parsed: %d articles\n"
+        "LLM Failed: %d articles\n"
         "SourceTime: %s\n"
         "=========================",
-        r.provider, r.total, r.inserted, r.skipped, r.deleted, r.source_time,
+        r.provider, r.total, r.inserted, r.skipped, r.deleted,
+        r.parsed, r.parse_failed, r.source_time,
     )
 
 
@@ -319,7 +324,8 @@ async def trigger_ingest():
     """
     Trigger a manual ingestion run synchronously.
 
-    The run is bounded by cfg.ingest_timeout (default 120 s).
+    The run is bounded by cfg.ingest_timeout (default 900 s) so it can cover
+    the provider fetch plus up to 7 sequential LLMPing parse calls.
     Returns the IngestionResult when done.
     Returns 500 if ingestion itself errors (e.g., DB unreachable).
     """

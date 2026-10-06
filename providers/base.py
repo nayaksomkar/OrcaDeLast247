@@ -107,14 +107,33 @@ async def fetch_json(
 
     A fixed User-Agent header is added because some providers reject
     requests without one.
+
+    SECURITY: provider keys travel in the query string (apiKey/token), and
+    httpx error messages restate the full URL. Every failure is re-raised as
+    a RuntimeError carrying only the status/host WITHOUT the query string,
+    so API keys never leak into application logs.
     """
     default_headers = {"User-Agent": "Last247-Ingestion/1.0"}
     if headers:
         default_headers.update(headers)
 
+    # Safe identifier for error messages: scheme + host + path only —
+    # never the query string, which is where API keys live for these APIs.
+    safe_url = url.split("?", 1)[0]
+
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(url, params=params, headers=default_headers)
-        resp.raise_for_status()  # raises HTTPStatusError on 4xx/5xx
+        try:
+            resp = await client.get(url, params=params, headers=default_headers)
+            resp.raise_for_status()  # raises HTTPStatusError on 4xx/5xx
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"{safe_url} returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            # Wrap instead of propagating: str(exc) may embed the full URL.
+            raise RuntimeError(
+                f"{safe_url} request failed: {type(exc).__name__}"
+            ) from exc
         return resp.json()
 
 

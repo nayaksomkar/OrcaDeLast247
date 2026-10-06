@@ -12,8 +12,11 @@ Data flow (one cycle):
     4. Normalize ProviderArticle → Article (add id, fetched_at, provider).
     5. Deduplicate by URL within the run (DB handles cross-run dupes via UNIQUE).
     6. Upsert each valid article into the DB.
-    7. Delete articles older than the retention window.
-    8. Return IngestionResult summary.
+    7. LLM phase: for each upserted article (max cfg.max_articles = 7), send
+       system prompt + article data to LLMPing /chat and store the parsed
+       answer on the row (llm_* columns). Failures are logged and skipped.
+    8. Delete articles older than the retention window.
+    9. Return IngestionResult summary.
 """
 
 from __future__ import annotations
@@ -28,8 +31,11 @@ from database import (
     article_id,
     count_articles,
     delete_stale_articles,
+    save_llm_parse,
     upsert_article,
 )
+from llmping import build_article_prompt, resolve_system_prompt
+from llmping import chat as llmping_chat
 from models import Article, IngestionResult
 from providers import GNews, NewsAPI, NewsDataIO, Provider, WebFetch
 
@@ -43,8 +49,11 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
     Sequential fallback: providers are tried in order. The first provider
     that returns usable articles wins; later providers are never called.
 
-    All providers failing is not an error — the function returns an empty
-    IngestionResult (total=0). The main loop logs this but does not crash.
+    After the upsert loop, every stored article is sent to the LLMPing LLM
+    Brain (system prompt + article data) and the parsed answer is persisted
+    on the article's row. All providers failing is not an error — the
+    function returns an empty IngestionResult (total=0). The main loop logs
+    this but does not crash.
 
     Args:
         cfg  : runtime configuration (provider keys, retention days, etc.)
@@ -100,12 +109,16 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
         return result
 
     # --- Normalize, deduplicate, upsert ---
+    # HARD CAP: some providers (NewsData.io) ignore the page-size param and
+    # return more rows than requested. MAX_ARTICLES is the per-run budget
+    # (7 → 7 sequential LLM calls), so trim the raw list before processing.
     now = datetime.now(timezone.utc)
     seen_urls: set[str] = set()
+    stored_this_run: list[Article] = []
     inserted = 0
     skipped = 0
 
-    for pa in raw_articles:
+    for pa in raw_articles[: cfg.max_articles]:
         # Drop articles without a title or URL.
         if not pa.url or not pa.title:
             skipped += 1
@@ -137,12 +150,52 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
             # FastAPI event loop.
             await asyncio.to_thread(upsert_article, conn, article)
             inserted += 1
+            stored_this_run.append(article)
         except Exception as exc:
             logger.warning("[ingest] failed to store %s: %s", pa.url, exc)
             skipped += 1
 
     result.inserted = inserted
     result.skipped = skipped
+
+    # --- LLM parse phase ---
+    # Each stored article is parsed by the LLMPing LLM Brain exactly once per
+    # run, sequentially, and its parsed answer is persisted on the row.
+    # A failure for one article never aborts the run — the article stays
+    # stored with llm_answer=None and the next article is processed.
+    logger.info("[ingest] LLM parse phase: %d article(s) queued", len(stored_this_run))
+    for article in stored_this_run:
+        try:
+            res = await llmping_chat(
+                cfg,
+                query=build_article_prompt(cfg, article),
+            )
+            await asyncio.to_thread(
+                save_llm_parse,
+                conn,
+                article.id,
+                res.answer,
+                res.provider,
+                res.model,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            result.parsed += 1
+            logger.info(
+                "[ingest] parsed %s via %s/%s",
+                article.url, res.provider or "?", res.model or "?",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ingest] LLM parse failed for %s: %s — skipping article",
+                article.url, exc,
+            )
+            result.parse_failed += 1
+
+    if stored_this_run:
+        logger.info(
+            "[ingest] LLM phase done: parsed=%d failed=%d",
+            result.parsed, result.parse_failed,
+        )
 
     # --- Retention sweep ---
     try:

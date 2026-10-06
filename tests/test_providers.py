@@ -148,7 +148,7 @@ async def test_gnews_fetch_normalizes_articles():
             }
         ]
     }
-    respx.get("https://gnews.io/v4/api/top-headlines").mock(
+    respx.get("https://gnews.io/api/v4/top-headlines").mock(
         return_value=httpx.Response(200, json=body)
     )
     articles = await GNews().fetch("tok", "en", 10, datetime(2026, 9, 1, tzinfo=timezone.utc))
@@ -253,3 +253,74 @@ async def test_webfetch_falls_back_to_image_field():
 async def test_webfetch_raises_when_no_base_url():
     with pytest.raises(RuntimeError, match="WEBFETCH_API_URL"):
         await WebFetch(base_url="").fetch("", "en", 10, datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Auth params + secret scrubbing (keys must never appear in error logs)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_gnews_sends_token_param():
+    route = respx.get("https://gnews.io/api/v4/top-headlines").mock(
+        return_value=httpx.Response(200, json={"articles": []})
+    )
+    await GNews().fetch("topsecret-token", "en", 7, datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+    params = dict(route.calls.last.request.url.params)
+    assert params["token"] == "topsecret-token"
+    assert params["max"] == "7"
+    assert params["lang"] == "en"
+    assert "from" not in params  # from/to are paid-plan-only on GNews
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_newsdata_sends_apikey_param():
+    route = respx.get("https://newsdata.io/api/1/news").mock(
+        return_value=httpx.Response(200, json={"status": "success", "results": []})
+    )
+    await NewsDataIO().fetch("topsecret-key", "en", 7, datetime(2026, 9, 1, tzinfo=timezone.utc))
+
+    params = dict(route.calls.last.request.url.params)
+    assert params["apikey"] == "topsecret-key"   # lowercase 'k' — NewsData requirement
+    assert params["language"] == "en"
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("provider_factory,routed,secret", [
+    ("newsapi", "https://newsapi.org/v2/everything", "leaky-newsapi-key"),
+    ("gnews", "https://gnews.io/api/v4/top-headlines", "leaky-gnews-token"),
+    ("newsdata", "https://newsdata.io/api/1/news", "leaky-newsdata-key"),
+])
+async def test_provider_http_error_does_not_leak_api_key(provider_factory, routed, secret):
+    """Failures must be raised as RuntimeError without the query string."""
+    respx.get(routed).mock(return_value=httpx.Response(429))
+
+    factories = {"newsapi": NewsAPI, "gnews": GNews, "newsdata": NewsDataIO}
+    with pytest.raises(RuntimeError) as excinfo:
+        await factories[provider_factory]().fetch(
+            secret, "en", 7, datetime(2026, 9, 1, tzinfo=timezone.utc)
+        )
+
+    # The key must not be anywhere in the error text, and no URL with its
+    # query string either (that's where the key travels for these APIs).
+    rendered = str(excinfo.value)
+    assert secret not in rendered
+    assert "429" in rendered
+    assert "apiKey=" not in rendered
+    assert "token=" not in rendered
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_provider_connection_error_does_not_leak_api_key():
+    respx.get("https://gnews.io/api/v4/top-headlines").mock(
+        side_effect=httpx.ConnectError("refused")
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await GNews().fetch(
+            "leaky-secret", "en", 7, datetime(2026, 9, 1, tzinfo=timezone.utc)
+        )
+    assert "leaky-secret" not in str(excinfo.value)

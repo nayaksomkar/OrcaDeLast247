@@ -7,6 +7,7 @@ No network, no Turso account, no files on disk.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,6 +18,7 @@ from database import (
     delete_stale_articles,
     get_article_by_id,
     list_articles,
+    save_llm_parse,
     upsert_article,
 )
 from models import Article
@@ -243,3 +245,92 @@ def test_delete_stale_articles_returns_zero_when_nothing_stale(tmp_db):
 
 def test_delete_stale_articles_on_empty_db(tmp_db):
     assert delete_stale_articles(tmp_db, retention_days=7) == 0
+
+
+# ---------------------------------------------------------------------------
+# LLM parse columns: save_llm_parse + schema migration
+# ---------------------------------------------------------------------------
+
+def test_save_llm_parse_updates_row(tmp_db):
+    a = _make_article(url="https://example.com/parse")
+    upsert_article(tmp_db, a)
+
+    n = save_llm_parse(
+        tmp_db, a.id, "PARSED DATA", "groq", "llama-3", "2026-10-06T00:00:00Z"
+    )
+    assert n == 1
+
+    stored = get_article_by_id(tmp_db, a.id)
+    assert stored.llm_answer == "PARSED DATA"
+    assert stored.llm_provider == "groq"
+    assert stored.llm_model == "llama-3"
+    assert stored.llm_processed_at == "2026-10-06T00:00:00Z"
+
+
+def test_save_llm_parse_leaves_raw_fields_untouched(tmp_db):
+    a = _make_article(url="https://example.com/keep")
+    upsert_article(tmp_db, a)
+    save_llm_parse(tmp_db, a.id, "PARSED", "p", "m", "2026-10-06T00:00:00Z")
+
+    # Re-ingest the same article (fresher title) — llm fields must survive.
+    refreshed = Article(
+        id=a.id, title="Refreshed Title", url=a.url,
+        published_at=_now(), fetched_at=_now(), provider="gnews",
+    )
+    upsert_article(tmp_db, refreshed)
+
+    stored = get_article_by_id(tmp_db, a.id)
+    assert stored.title == "Refreshed Title"
+    assert stored.llm_answer == "PARSED"
+    assert stored.llm_provider == "p"
+    assert stored.llm_model == "m"
+
+
+def test_save_llm_parse_unknown_id_returns_zero(tmp_db):
+    assert save_llm_parse(tmp_db, "doesnotexist000", "a", "p", "m", "now") == 0
+
+
+def test_list_articles_returns_llm_fields(tmp_db):
+    a = _make_article(url="https://example.com/llm-list")
+    upsert_article(tmp_db, a)
+    save_llm_parse(tmp_db, a.id, "ANS", "p", "m", "2026-10-06T00:00:00Z")
+
+    articles, _ = list_articles(tmp_db, limit=10, offset=0)
+    assert articles[0].llm_answer == "ANS"
+
+    b = _make_article(url="https://example.com/no-parse")
+    upsert_article(tmp_db, b)
+    articles, _ = list_articles(tmp_db, limit=10, offset=0)
+    unparsed = next(x for x in articles if x.url == b.url)
+    assert unparsed.llm_answer is None
+
+
+def test_init_db_migrates_legacy_schema_without_llm_columns():
+    """A table created before the LLM phase gets the llm_* columns on init_db."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE news (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT,
+            content TEXT, url TEXT NOT NULL UNIQUE, image_url TEXT,
+            source TEXT, author TEXT, category TEXT,
+            published_at TEXT NOT NULL, fetched_at TEXT NOT NULL, provider TEXT)"""
+    )
+    conn.commit()
+
+    from database import init_db
+    init_db(conn)  # must add the 4 llm_* columns without touching data
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(news)")}
+    assert {"llm_answer", "llm_provider", "llm_model", "llm_processed_at"} <= cols
+    conn.close()
+
+
+def test_init_db_migration_is_idempotent(tmp_db):
+    """init_db on a table that already has llm_* columns must not raise."""
+    from database import init_db
+    init_db(tmp_db)
+    init_db(tmp_db)  # second call — columns already exist
+
+    cols = {row["name"] for row in tmp_db.execute("PRAGMA table_info(news)")}
+    assert {"llm_answer", "llm_provider", "llm_model", "llm_processed_at"} <= cols

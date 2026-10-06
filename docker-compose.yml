@@ -10,16 +10,20 @@ services:
       - .env
     environment:
       - PORT=8080
-      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL:-file:./news.db}
+      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL:-file:/app/data/news.db}
       - TURSO_AUTH_TOKEN=${TURSO_AUTH_TOKEN:-}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-*}
-      - INGEST_INTERVAL=${INGEST_INTERVAL:-6h}
-      - INGEST_TIMEOUT=${INGEST_TIMEOUT:-120s}
+      - INGEST_INTERVAL=${INGEST_INTERVAL:-8h}
+      - INGEST_TIMEOUT=${INGEST_TIMEOUT:-900s}
       - RETENTION_DAYS=${RETENTION_DAYS:-7}
+      - MAX_ARTICLES=${MAX_ARTICLES:-7}
+      - LLMPING_BASE_URL=${LLMPING_BASE_URL:-https://llmping.onrender.com}
+      - LLMPING_CHAT_PATH=${LLMPING_CHAT_PATH:-/chat}
+      - LLMPING_TIMEOUT=${LLMPING_TIMEOUT:-60s}
+      - LLMPING_API_TOKEN=${LLMPING_API_TOKEN:-}
+      - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}
+      - LLM_MAX_CONTENT_CHARS=${LLM_MAX_CONTENT_CHARS:-4000}
     volumes:
-      # Persist local SQLite file if file:./news.db is used
-      - db-data:/app/data
+      # Persist the local SQLite file when file:./news.db is used
+      - ./db-data:/app/data
     restart: unless-stopped
-
-volumes:
-  db-data:

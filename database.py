@@ -11,8 +11,10 @@ Public API
 ----------
 article_id(url)                      → 16-char hex string (deterministic)
 open_db(turso_url, turso_token)      → connection object
-init_db(conn)                        → creates table + indexes (idempotent)
+init_db(conn)                        → creates table + indexes + llm columns (idempotent)
 upsert_article(conn, article)        → INSERT OR REPLACE
+save_llm_parse(conn, article_id, answer, provider, model, processed_at)
+                                     → store the LLM parse result on an article row
 list_articles(conn, ...)             → ([Article], total_count)
 get_article_by_id(conn, id)          → Article | None
 count_articles(conn)                 → int
@@ -130,6 +132,9 @@ def init_db(conn: Any) -> None:
       published_at TEXT NOT NULL     — ISO 8601 UTC (lexicographic = chronological)
       fetched_at   TEXT NOT NULL     — ISO 8601 UTC
       provider     TEXT              — "newsapi" | "gnews" | "newsdata" | "webfetch"
+
+    Also adds the LLM parse-result columns (idempotent ALTER TABLE ADD COLUMN),
+    so databases created before the LLM phase get them transparently.
     """
     schema = """
 CREATE TABLE IF NOT EXISTS news (
@@ -151,6 +156,36 @@ CREATE INDEX IF NOT EXISTS idx_news_url          ON news (url);
 """
     with _sqlite_lock:
         conn.executescript(schema)
+        conn.commit()
+        _ensure_llm_columns(conn)
+
+
+# Columns holding the per-article LLM parse result. Nullable — None means the
+# article has not been processed by the LLM Brain (LLMPing) yet.
+_LLM_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("llm_answer", "TEXT"),
+    ("llm_provider", "TEXT"),
+    ("llm_model", "TEXT"),
+    ("llm_processed_at", "TEXT"),
+)
+
+
+def _ensure_llm_columns(conn: Any) -> None:
+    """
+    Add the llm_* columns to the news table if they are missing.
+
+    Uses ALTER TABLE ADD COLUMN guarded by a duplicate-column check so it is
+    idempotent and portable across SQLite and remote libsql connections
+    (PRAGMA table_info is not reliably available over the Hrana protocol).
+    """
+    for name, ddl in _LLM_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE news ADD COLUMN {name} {ddl}")
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                continue
+            raise
         conn.commit()
 
 
@@ -207,6 +242,34 @@ ON CONFLICT(url) DO UPDATE SET
         conn.commit()
 
 
+def save_llm_parse(
+    conn: Any,
+    article_id_val: str,
+    answer: str,
+    provider: str,
+    model: str,
+    processed_at: str,
+) -> int:
+    """
+    Store the LLM Brain's parsed result on the article's existing row.
+
+    Only touches the llm_* columns, so it can never clobber the raw article
+    fields written by upsert_article(). The answer is stored exactly as
+    received from LLMPing — the DB row is the final processed record.
+
+    Returns the number of rows updated (0 means the article_id does not exist).
+    """
+    with _sqlite_lock:
+        cursor = conn.execute(
+            "UPDATE news SET "
+            "llm_answer = ?, llm_provider = ?, llm_model = ?, llm_processed_at = ? "
+            "WHERE id = ?",
+            (answer, provider, model, processed_at, article_id_val),
+        )
+        conn.commit()
+    return cursor.rowcount
+
+
 def _row_to_article(row: Any) -> Article:
     """
     Convert a DB row (sqlite3.Row or libsql row) into an Article.
@@ -234,6 +297,7 @@ def _row_to_article(row: Any) -> Article:
             "id", "title", "description", "content", "url",
             "image_url", "source", "author", "category",
             "published_at", "fetched_at", "provider",
+            "llm_answer", "llm_provider", "llm_model", "llm_processed_at",
         ]
         d = dict(zip(keys, row))
 
@@ -250,12 +314,17 @@ def _row_to_article(row: Any) -> Article:
         published_at=_dt(d["published_at"]),
         fetched_at=_dt(d["fetched_at"]),
         provider=d.get("provider") or "",
+        llm_answer=_str(d.get("llm_answer")),
+        llm_provider=_str(d.get("llm_provider")),
+        llm_model=_str(d.get("llm_model")),
+        llm_processed_at=_str(d.get("llm_processed_at")),
     )
 
 
 _SELECT_COLS = (
     "id, title, description, content, url, image_url, "
-    "source, author, category, published_at, fetched_at, provider"
+    "source, author, category, published_at, fetched_at, provider, "
+    "llm_answer, llm_provider, llm_model, llm_processed_at"
 )
 
 

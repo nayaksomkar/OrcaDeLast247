@@ -1,21 +1,23 @@
 # Last247 — UI / API Integration Guide
 
-Complete reference for the frontend/UI team to integrate with the Last247 Go backend microservice. All endpoints, schemas, and behaviors documented here are verified against the actual implementation.
+Complete reference for the frontend/UI team to integrate with the Last247 Python (FastAPI) backend service. All endpoints, schemas, and behaviors documented here are verified against the actual implementation.
 
 ---
 
 ## 1. Overview
 
-The Last247 service is a Go HTTP microservice that:
+The Last247 service is a Python (FastAPI) HTTP service that:
 
 1. **Ingests** news from provider APIs (NewsAPI, GNews, NewsData.io, WebFetch) using sequential fallback.
 2. **Stores** normalized, deduplicated articles in a Turso database.
-3. **Serves** the stored articles via a JSON HTTP API.
+3. **Parses** each stored article with the external LLMPing LLM Brain (`POST /chat` — system prompt + article data) and stores the parsed answer on the article row. 3 runs/day × 7 articles = 21 LLM parse calls/day.
+4. **Serves** the stored (and parsed) articles via a JSON HTTP API.
 
 ```text
-News providers → Go Ingestion Service (this repo) → Turso `news` table
-                                              ↘
-                                           HTTP API (served here) ← Next.js Frontend
+News providers → Last247 Ingestion (this repo) → Turso `news` table
+                                      ↘ per article: LLMPing /chat → llm_* columns
+                                           ↓
+                                       HTTP API (served here) ← Next.js Frontend
 ```
 
 The frontend talks to this service via HTTP. This service never calls the frontend.
@@ -91,7 +93,11 @@ Paginated list of stored articles, newest first. Supports optional filtering by 
       "category": "Technology",
       "published_at": "2026-09-30T10:00:00Z",
       "fetched_at": "2026-09-30T12:34:56Z",
-      "provider": "newsapi"
+      "provider": "newsapi",
+      "llm_answer": "PARSED — structured result produced by the LLM Brain",
+      "llm_provider": "llmping-provider-name",
+      "llm_model": "llmping-model-name",
+      "llm_processed_at": "2026-09-30T12:35:02Z"
     }
   ],
   "total": 42,
@@ -145,7 +151,11 @@ Retrieve a single article by its deterministic ID.
   "category": "Technology",
   "published_at": "2026-09-30T10:00:00Z",
   "fetched_at": "2026-09-30T12:34:56Z",
-  "provider": "newsapi"
+  "provider": "newsapi",
+  "llm_answer": "PARSED — structured result produced by the LLM Brain",
+  "llm_provider": "llmping-provider-name",
+  "llm_model": "llmping-model-name",
+  "llm_processed_at": "2026-09-30T12:35:02Z"
 }
 ```
 
@@ -178,10 +188,12 @@ Returns the total article count and metadata about the last ingestion run.
   "total_articles": 142,
   "last_ingestion": {
     "provider": "newsapi",
-    "total": 50,
-    "inserted": 45,
-    "skipped": 5,
+    "total": 7,
+    "inserted": 7,
+    "skipped": 0,
     "deleted": 3,
+    "parsed": 7,
+    "parse_failed": 0,
     "source_time": "2026-10-02T06:00:00Z"
   }
 }
@@ -192,7 +204,7 @@ Returns the total article count and metadata about the last ingestion run.
 | `total_articles` | int | Total number of articles currently in the `news` table. |
 | `last_ingestion` | object | Result of the most recent ingestion run. Absent if no ingestion has run yet. |
 
-**`last_ingestion` sub-fields** (IngestionResult struct from `ingest.go`):
+**`last_ingestion` sub-fields** (`IngestionResult` dataclass from `models.py`):
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -201,6 +213,8 @@ Returns the total article count and metadata about the last ingestion run.
 | `inserted` | int | Rows inserted or updated in the database. |
 | `skipped` | int | Articles dropped (invalid, duplicate URL within run, or DB insert failure). |
 | `deleted` | int | Stale articles removed by the retention sweep. |
+| `parsed` | int | Articles successfully parsed by the LLM Brain (LLMPing) during the run. |
+| `parse_failed` | int | Articles whose LLM parse failed (skipped; their rows keep `llm_answer = null`). |
 | `source_time` | string | When the provider was queried (RFC 3339 UTC). |
 
 **Error responses**
@@ -213,7 +227,7 @@ Returns the total article count and metadata about the last ingestion run.
 
 ### `POST /api/ingest` — Trigger Ingestion
 
-Triggers a manual ingestion run. The service also runs ingestion automatically on startup and then periodically (every `INGEST_INTERVAL`, default 6h). Use this endpoint to force a run on demand.
+Triggers a manual ingestion run (fetch → store → per-article LLMPing parse). The service also runs ingestion automatically on startup and then periodically (every `INGEST_INTERVAL`, default 8h). Use this endpoint to force a run on demand.
 
 **Parameters:** None
 
@@ -226,10 +240,12 @@ Triggers a manual ingestion run. The service also runs ingestion automatically o
   "success": true,
   "result": {
     "provider": "newsapi",
-    "total": 50,
-    "inserted": 45,
-    "skipped": 5,
+    "total": 7,
+    "inserted": 7,
+    "skipped": 0,
     "deleted": 3,
+    "parsed": 7,
+    "parse_failed": 0,
     "source_time": "2026-10-02T06:00:00Z"
   }
 }
@@ -240,13 +256,13 @@ Triggers a manual ingestion run. The service also runs ingestion automatically o
 | Status | Code | Description |
 |--------|------|-------------|
 | 500 | `INGEST_ERROR` | Ingestion failed (e.g., database unreachable). |
-| 503 | `INGEST_TIMEOUT` | Ingestion did not complete within `INGEST_TIMEOUT` (default 120s). *(Not yet implemented — returns 500 with `INGEST_ERROR` if the context is cancelled.)* |
+| 500 | `INGEST_TIMEOUT` | Ingestion did not complete within `INGEST_TIMEOUT` (default 900s). |
 
 ---
 
 ## 4. Article Data Model
 
-The `Article` struct (in `article.go`) is the canonical data shape for articles returned by all endpoints. It matches the `news` table columns exactly. Fields with `omitempty` JSON tags are omitted from the response when they are empty strings.
+The `Article` model (in `models.py`) is the canonical data shape for articles returned by all endpoints. It matches the `news` table columns exactly. Optional fields are omitted from the response when they are empty.
 
 ```typescript
 interface Article {
@@ -260,8 +276,12 @@ interface Article {
   author?: string;       // may be absent (NewsData.io joins multiple with ", ")
   category?: string;     // single category, may be absent
   published_at: string;  // ISO 8601 / RFC 3339, UTC, NOT NULL
-  fetched_at: string;   // ISO 8601 / RFC 3339, UTC, NOT NULL
-  provider: string;     // "newsapi" | "gnews" | "newsdata" | "webfetch"
+  fetched_at: string;    // ISO 8601 / RFC 3339, UTC, NOT NULL
+  provider: string;      // "newsapi" | "gnews" | "newsdata" | "webfetch"
+  llm_answer?: string;   // parsed answer from the LLM Brain, stored as received
+  llm_provider?: string; // LLMPing-reported provider used for the parse
+  llm_model?: string;    // LLMPing-reported model used for the parse
+  llm_processed_at?: string; // ISO 8601 UTC, when the parse was stored
 }
 ```
 
@@ -275,7 +295,8 @@ interface Article {
 | `published_at` | Never `null`. Always valid ISO 8601. If the source timestamp is unparseable, it falls back to `now`. |
 | `fetched_at` | Never `null`. UTC timestamp of when the service stored the article. |
 | `provider` | Never `null`. One of `"newsapi"`, `"gnews"`, `"newsdata"`, `"webfetch"`. |
-| `description`, `content`, `image_url`, `source`, `author`, `category` | May be `null` in the database. In JSON, they are **omitted** when empty (Go `omitempty`). |
+| `description`, `content`, `image_url`, `source`, `author`, `category` | May be `null` in the database. In JSON, they are **omitted** when empty. |
+| `llm_answer`, `llm_provider`, `llm_model`, `llm_processed_at` | `null`/absent until the article has been parsed by the LLM Brain. After a successful parse, `llm_answer` is always a non-empty string. Re-ingesting the same URL never erases a stored parse. |
 
 ### Optional fields handling in the UI
 
@@ -286,13 +307,14 @@ const imageUrl = article.image_url || '/placeholder.png';
 const source = article.source || 'Unknown';
 const author = article.author || 'Unknown';
 // description and content may be undefined — check before rendering
+// llm_answer is null until the LLMPing parse phase has processed the article
 ```
 
 ---
 
 ## 5. CORS Support
 
-The service includes a CORS middleware (`api.go`) configured via the `CORS_ALLOW_ORIGINS` environment variable.
+The service includes a CORS middleware (`main.py`) configured via the `CORS_ALLOW_ORIGINS` environment variable.
 
 | Env var | Default | Description |
 |---------|---------|-------------|
@@ -325,15 +347,16 @@ CORS_ALLOW_ORIGINS=*
 
 ## 6. Data Flow
 
-### Ingestion: providers → database (write path)
+### Ingestion: providers → database → LLM parse (write path)
 
 1. **Startup**: On service start, an initial ingestion run fires immediately.
-2. **Background**: After the initial run, ingestion repeats every `INGEST_INTERVAL` (default 6h).
+2. **Background**: After the initial run, ingestion repeats every `INGEST_INTERVAL` (default 8h).
 3. **Fallback chain**: Providers are tried in order — NewsAPI → GNews → NewsData.io → WebFetch. The first provider with a valid API key that returns ≥1 article wins. All providers are never called simultaneously.
 4. **Normalization**: Each provider's response is normalized into the `Article` shape.
-5. **Deduplication**: Within a run, duplicate URLs are skipped. Across runs, `ON CONFLICT(url) DO UPDATE` refreshes existing rows.
-6. **Retention**: At the end of each run, articles with `published_at` older than `RETENTION_DAYS` (default 7) are deleted.
-7. **Result**: The result is stored in memory and returned by `GET /api/stats` and `POST /api/ingest`.
+5. **Deduplication**: Within a run, duplicate URLs are skipped. Across runs, `ON CONFLICT(url) DO UPDATE` refreshes existing raw fields.
+6. **LLM parse phase**: Each stored article (max `MAX_ARTICLES` = 7) is sent to the LLMPing LLM Brain (`POST /chat` with system prompt + article data) and the parsed answer is stored on the row (`llm_answer`, `llm_provider`, `llm_model`, `llm_processed_at`). Per-article failures are logged and skipped.
+7. **Retention**: At the end of each run, articles with `published_at` older than `RETENTION_DAYS` (default 7) are deleted.
+8. **Result**: The result is stored in memory and returned by `GET /api/stats` and `POST /api/ingest`.
 
 ### API: database → frontend (read path)
 
@@ -357,8 +380,8 @@ All configuration is via environment variables. The `.env` file is supported for
 | `TURSO_DATABASE_URL` | **Yes** | — | Turso connection string (`libsql://name.turso.io`) or local file (`file:./news.db`). |
 | `TURSO_AUTH_TOKEN` | Remote only | `""` | Turso auth token. Leave empty for local file databases. |
 | `PORT` | No | `8080` | HTTP listen port (Render provides this dynamically). |
-| `INGEST_INTERVAL` | No | `6h` | Background ingestion cadence (e.g., `6h`, `30m`). |
-| `INGEST_TIMEOUT` | No | `120s` | Max duration for one ingestion run. |
+| `INGEST_INTERVAL` | No | `8h` | Background ingestion cadence (3 runs/day). |
+| `INGEST_TIMEOUT` | No | `900s` | Max duration for one ingestion run, including the LLM parse phase. |
 | `RETENTION_DAYS` | No | `7` | Rolling retention window in days. |
 | `NEWS_API_KEY` | One of four | `""` | NewsAPI key (provider #1). |
 | `GNEWS_API_KEY` | One of four | `""` | GNews key (provider #2). |
@@ -366,8 +389,14 @@ All configuration is via environment variables. The `.env` file is supported for
 | `WEBFETCH_API_URL` | One of four | `""` | WebFetch base URL (provider #4). |
 | `WEBFETCH_API_KEY` | Conditional | `""` | WebFetch API key (optional — endpoint may be open). |
 | `NEWS_LANGUAGE` | No | `en` | Article language filter. |
-| `MAX_ARTICLES` | No | `50` | Max articles fetched per provider per run. |
+| `MAX_ARTICLES` | No | `7` | Max articles fetched (and LLM-parsed) per run. |
 | `CORS_ALLOW_ORIGINS` | No | `*` | Comma-separated allowed CORS origins. |
+| `LLMPING_BASE_URL` | No | `https://llmping.onrender.com` | LLMPing LLM Brain base URL. |
+| `LLMPING_CHAT_PATH` | No | `/chat` | Chat endpoint path. |
+| `LLMPING_TIMEOUT` | No | `60s` | Max duration of one LLMPing `/chat` call. |
+| `LLMPING_API_TOKEN` | No | `""` | Optional Bearer token — sent only when set. |
+| `LLM_SYSTEM_PROMPT` | No | placeholder | System instructions sent with every article. |
+| `LLM_MAX_CONTENT_CHARS` | No | `4000` | Max description/content characters in a prompt. |
 
 ---
 
@@ -546,15 +575,16 @@ async function triggerIngest() {
 5. **No user authentication**: No auth is implemented. In production, put the service behind a reverse proxy or firewall if needed.
 6. **Provider order is fixed**: NewsAPI → GNews → NewsData.io → WebFetch. Only the first provider with a key that returns articles is used per run.
 7. **Retention**: Articles older than `RETENTION_DAYS` (default 7) are deleted at the end of each ingestion run. The database only contains recent articles.
-8. **Upsert semantics**: Re-fetching the same article URL refreshes all fields (title, description, content, image, etc.) via `ON CONFLICT(url) DO UPDATE`.
+8. **Upsert semantics**: Re-fetching the same article URL refreshes the raw fields (title, description, content, image, etc.) via `ON CONFLICT(url) DO UPDATE`. The `llm_*` parse fields are never touched by upserts — the parse phase writes them again on each run.
+9. **LLM parse fields**: `llm_answer` is the raw reply from the LLM Brain, stored as received. Do not assume a specific JSON structure inside it — the format is defined by `LLM_SYSTEM_PROMPT`.
 
 ---
 
-*Generated from the Go backend source. Last verified against:*
-- `article.go` — Article struct and JSON/DB tags
-- `db.go` — Database schema, ListArticles, GetArticleByID, GetArticleByURL, CountArticles
-- `config.go` — Environment variable loading and defaults
-- `ingest.go` — IngestionResult struct, runIngestion logic
-- `api.go` — HTTP handlers, CORS middleware, helpers
-- `main.go` — HTTP server setup, routes, background ingestion
-- `providers/providers.go` — HTTP fetching and JSON decoding
+*Generated from the Python backend source. Last verified against:*
+- `models.py` — Article model and IngestionResult
+- `database.py` — schema, list_articles, get_article_by_id, save_llm_parse
+- `config.py` — environment variable loading and defaults
+- `ingest.py` — run_ingestion logic (fetch → store → LLM parse)
+- `llmping.py` — LLMPing client, prompt builder, system prompt
+- `main.py` — FastAPI app, routes, CORS middleware, background ingestion
+- `providers/` — provider classes and sequential fallback
