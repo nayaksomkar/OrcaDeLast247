@@ -7,7 +7,7 @@ actual running service (real requests, real captured responses).
 |------|-------|
 | Base URL | **`https://orcadelast247.onrender.com`** |
 | Auth | None — no keys or headers required |
-| CORS | `*` — preflight answered `200` with `access-control-allow-origin: *`; the UI can call it from any origin |
+| CORS | Configured via `CORS_ALLOW_ORIGINS` (comma-separated). This deployment currently runs with `*`; setting the env var to e.g. `http://localhost:3000,https://your-frontend.vercel.app` restricts it — allowed origins are echoed exactly, disallowed ones get no CORS header. Preflight answered `200` with `access-control-allow-methods: GET, POST, OPTIONS` and `Content-Type` allowed. The UI can call it from any allowed origin |
 | Methods allowed | `GET`, `POST`, `OPTIONS` |
 
 The backend auto-ingests at startup and every 8 h; the UI only ever **reads**.

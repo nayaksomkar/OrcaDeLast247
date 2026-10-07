@@ -185,22 +185,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware is configured from cfg.cors_origins, but since we need
-# cfg at app-creation time and it isn't loaded yet, we add CORS dynamically
-# after startup — or use a simpler approach: read from env directly here.
+# CORS middleware is configured from the CORS_ALLOW_ORIGINS env var
+# (comma-separated list, e.g. "http://localhost:3000,http://127.0.0.1:3000").
+# The kwargs are built by a helper so tests can exercise the exact same
+# middleware configuration the app uses.
 import os as _os
 from dotenv import load_dotenv as _load_dotenv
 _load_dotenv(".env", override=False)
-_raw_cors = _os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
-_cors_origins = [o.strip() for o in _raw_cors.split(",") if o.strip()] or ["*"]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-    allow_credentials=False,
-)
+
+def cors_middleware_kwargs() -> dict:
+    """Build the CORSMiddleware kwargs from CORS_ALLOW_ORIGINS.
+
+    Comma-separated origins are parsed into a list; empty/unset falls back to
+    ["*"] (allow all). No credentials — the API is public and cookie-free.
+    """
+    raw = _os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+    origins = [o.strip() for o in raw.split(",") if o.strip()] or ["*"]
+    return {
+        "allow_origins": origins,
+        "allow_methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"],
+        "allow_credentials": False,
+    }
+
+
+app.add_middleware(CORSMiddleware, **cors_middleware_kwargs())
 
 # ---------------------------------------------------------------------------
 # Request logging middleware

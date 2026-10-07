@@ -198,22 +198,77 @@ async def test_ingest_returns_success_with_no_providers(async_client):
 # CORS headers
 # ---------------------------------------------------------------------------
 
+# conftest pins CORS_ALLOW_ORIGINS to the two local dev origins before main
+# is imported, so the app under test uses an explicit-origin configuration.
+_DEV_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
+
+
 @pytest.mark.asyncio
-async def test_cors_headers_present_on_response(async_client):
+async def test_cors_allowed_origin_gets_exact_echo(async_client):
+    for origin in _DEV_ORIGINS:
+        resp = await async_client.get("/health", headers={"Origin": origin})
+        assert resp.status_code == 200
+        # Not "*" — the configured origin is echoed back exactly.
+        assert resp.headers["access-control-allow-origin"] == origin
+
+
+@pytest.mark.asyncio
+async def test_cors_disallowed_origin_gets_no_header(async_client):
     resp = await async_client.get(
-        "/health", headers={"Origin": "https://app.last247.dev"}
+        "/health", headers={"Origin": "https://evil.example"}
     )
-    # With CORS_ALLOW_ORIGINS=* the header should be present.
-    assert "access-control-allow-origin" in resp.headers
+    assert resp.status_code == 200
+    assert "access-control-allow-origin" not in resp.headers
 
 
 @pytest.mark.asyncio
-async def test_cors_options_preflight_returns_204(async_client):
+@pytest.mark.parametrize("path,method", [("/api/news", "GET"), ("/api/ingest", "POST")])
+async def test_cors_options_preflight_succeeds(async_client, path, method):
+    """Browser preflight must succeed for every endpoint the frontend uses."""
     resp = await async_client.options(
-        "/api/news",
+        path,
         headers={
-            "Origin": "https://app.last247.dev",
-            "Access-Control-Request-Method": "GET",
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": method,
+            "Access-Control-Request-Headers": "content-type",
         },
     )
-    assert resp.status_code == 200  # FastAPI CORSMiddleware returns 200 for OPTIONS
+    assert resp.status_code == 200  # CORSMiddleware answers preflight with 200
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert method in resp.headers["access-control-allow-methods"]
+    assert "content-type" in resp.headers["access-control-allow-headers"].lower()
+
+
+@pytest.mark.asyncio
+async def test_cors_get_api_news_with_browser_origin(async_client):
+    """The exact request the frontend makes: GET /api/news with a browser Origin."""
+    resp = await async_client.get(
+        "/api/news", headers={"Origin": "http://localhost:3000"}
+    )
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
+def test_cors_middleware_kwargs_parse_comma_separated_origins(monkeypatch):
+    """The middleware builder must split the env var correctly."""
+    from main import cors_middleware_kwargs
+
+    monkeypatch.setenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:3000, http://127.0.0.1:3000 ,https://app.example",
+    )
+    kwargs = cors_middleware_kwargs()
+    assert kwargs["allow_origins"] == [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://app.example",
+    ]
+    assert kwargs["allow_methods"] == ["GET", "POST", "OPTIONS"]
+    assert kwargs["allow_headers"] == ["Content-Type"]
+    assert kwargs["allow_credentials"] is False
+
+    monkeypatch.delenv("CORS_ALLOW_ORIGINS")
+    assert cors_middleware_kwargs()["allow_origins"] == ["*"]  # wildcard fallback
+
+    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "  ,  ")  # only blanks → fallback
+    assert cors_middleware_kwargs()["allow_origins"] == ["*"]

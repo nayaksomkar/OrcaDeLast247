@@ -9,6 +9,7 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 from typing import Any
 
@@ -17,6 +18,14 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from database import init_db
+
+# Pin the CORS origins before `main` is imported anywhere: main.py reads
+# CORS_ALLOW_ORIGINS (falling back to the developer's local .env) at import
+# time to configure its middleware. Tests must not depend on local .env
+# contents. load_dotenv(override=False) inside main.py keeps this value.
+os.environ.setdefault(
+    "CORS_ALLOW_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+)
 
 
 # ---------------------------------------------------------------------------

@@ -25,10 +25,14 @@ network/proxy level — e.g. Render's access controls or a reverse proxy.)
 
 ## CORS
 
-Configured via `CORS_ALLOW_ORIGINS` (default `*`). Allowed methods: `GET`,
-`POST`, `OPTIONS`; allowed header: `Content-Type`; credentials not allowed.
-Pre-flight (`OPTIONS`) replies `HTTP 200` with the standard
-`access-control-allow-*` headers.
+Configured via `CORS_ALLOW_ORIGINS` — a comma-separated origin list, e.g.
+`http://localhost:3000,http://127.0.0.1:3000` (the shipped default in
+`.env.example`); empty/unset falls back to `*`. Allowed origins are echoed
+exactly in `access-control-allow-origin`; disallowed origins get **no** CORS
+header. Allowed methods: `GET`, `POST`, `OPTIONS`; allowed header:
+`Content-Type`; credentials not allowed. Pre-flight (`OPTIONS`) replies
+`HTTP 200` with the standard `access-control-allow-*` headers — verified live
+for both dev origins and for `OPTIONS /api/news` + `OPTIONS /api/ingest`.
 
 ---
 
