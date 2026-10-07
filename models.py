@@ -77,15 +77,21 @@ class IngestionResult:
     """
     Summary of one ingestion cycle returned by run_ingestion().
 
-    provider   : name of the provider that won the fallback chain ("sample"
-                 in SAMPLE_DATA mode, "" if all providers failed).
-    total      : raw article count returned by the winning provider.
+    provider   : name of the first provider that contributed articles
+                 ("sample" in SAMPLE_DATA mode, "" if all providers failed).
+    total      : usable, URL-deduplicated articles collected for this run
+                 (across the provider fallback, capped at max_articles).
     inserted   : rows actually upserted into the DB.
-    skipped    : articles dropped (no title/URL, in-run dupe, or DB error).
+    skipped    : articles dropped at the store stage (DB error). Title-less
+                 and in-run duplicate URLs are filtered out during the
+                 provider fetch accumulation, before counting.
     deleted    : stale articles removed by the retention sweep at run end.
     parsed     : articles successfully processed by the LLM Brain (LLMPing) this run.
     parse_failed: articles whose LLM parse failed (upstream error/timeout) — the
                  article row remains stored with llm_answer=None.
+    categorized: articles that got a category written to the `category` column
+                 this run (from the LLM parse result or a provider-supplied
+                 fallback; 0 when the row already had a usable category).
     source_time: ISO 8601 UTC timestamp of when the provider was queried.
     """
 
@@ -96,6 +102,7 @@ class IngestionResult:
     deleted: int = 0
     parsed: int = 0
     parse_failed: int = 0
+    categorized: int = 0
     source_time: str = field(
         default_factory=lambda: datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     )
@@ -109,5 +116,6 @@ class IngestionResult:
             "deleted": self.deleted,
             "parsed": self.parsed,
             "parse_failed": self.parse_failed,
+            "categorized": self.categorized,
             "source_time": self.source_time,
         }

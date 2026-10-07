@@ -9,11 +9,12 @@ Required:
     TURSO_DATABASE_URL  — libSQL connection string or local file path.
 
 Optional (all have sensible defaults):
-    TURSO_AUTH_TOKEN    PORT  INGEST_INTERVAL  INGEST_TIMEOUT  RETENTION_DAYS
+    TURSO_AUTH_TOKEN  PORT  INGEST_INTERVAL  INGEST_TIMEOUT  RETENTION_DAYS
     NEWS_API_KEY  GNEWS_API_KEY  NEWS_DATA_API_KEY  WEBFETCH_API_URL
     WEBFETCH_API_KEY  NEWS_LANGUAGE  MAX_ARTICLES  CORS_ALLOW_ORIGINS
     LLMPING_BASE_URL  LLMPING_CHAT_PATH  LLMPING_TIMEOUT  LLMPING_API_TOKEN
     LLM_SYSTEM_PROMPT  LLM_MAX_CONTENT_CHARS
+    RUN_ONCE  NULL_CHECK_INTERVAL  CATEGORY_BACKFILL_ONCE
 
 Usage:
     from config import load_config
@@ -51,17 +52,31 @@ class Config:
     Fetch options
     -------------
     language     : BCP 47 language tag used by provider queries (default "en").
-    max_articles : Max articles requested per provider per run (default 7).
+    max_articles : Max articles requested per provider per run (default 10).
 
     HTTP server
     -----------
     port             : TCP port the server listens on (default "8080").
                        Render provides PORT dynamically.
-    ingest_interval  : Seconds between background ingestion runs (default 28800 = 8h).
+    ingest_interval  : Seconds between background ingestion runs (default 7200 = 2h).
     ingest_timeout   : Max seconds for one ingestion run, including the per-article
                        LLM parse phase (default 900).
     cors_origins     : List of allowed CORS origins (default ["*"] = allow all).
     retention_days   : Rolling article window in days; older rows are deleted (default 7).
+
+    Scheduling / maintenance
+    ------------------------
+    run_once                : When true (only honored by `python main.py`), run one
+                              backfill/ingestion/repair pass and exit — no scheduler.
+                              For local testing; continuous deploys keep this false.
+    null_check_interval     : Seconds between NULL/empty-field repair checks
+                              (default 7200 = 2h). The repair only touches
+                              incomplete rows; healthy rows are never reprocessed.
+    category_backfill_once  : When true, run the one-time category backfill over
+                              EXISTING rows at startup — but only if the
+                              "category_backfill_done" marker is absent from the DB
+                              meta table. After a successful run the marker is
+                              written, so every later start is a no-op.
 
     LLMPing (LLM Brain)
     -------------------
@@ -92,13 +107,18 @@ class Config:
 
     # Fetch options
     language: str = "en"
-    max_articles: int = 7
+    max_articles: int = 10
 
     # HTTP server
     port: str = "8080"
-    ingest_interval: int = 28_800   # seconds (8 h — 3 runs/day)
-    ingest_timeout: int = 900       # seconds, covers fetch + 7 sequential LLM calls
+    ingest_interval: int = 7_200   # seconds (2 h — 12 runs/day)
+    ingest_timeout: int = 900      # seconds, covers fetch + sequential LLM calls
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+
+    # Scheduling / maintenance
+    run_once: bool = False
+    null_check_interval: int = 7_200   # seconds (2 h repair check)
+    category_backfill_once: bool = False
 
     # SAMPLE_DATA mode (testing): when true the real news APIs are NOT called
     # and data/sample_news.json is fed through the same pipeline instead.
@@ -147,7 +167,7 @@ def load_config() -> Config:
 
     # Fetch options.
     cfg.language     = os.getenv("NEWS_LANGUAGE", "en").strip() or "en"
-    cfg.max_articles = _parse_positive_int(os.getenv("MAX_ARTICLES", ""), 7)
+    cfg.max_articles = _parse_positive_int(os.getenv("MAX_ARTICLES", ""), 10)
 
     # Retention window.
     cfg.retention_days = _parse_positive_int(os.getenv("RETENTION_DAYS", ""), 7)
@@ -155,13 +175,17 @@ def load_config() -> Config:
     # HTTP server.
     cfg.port = os.getenv("PORT", "8080").strip() or "8080"
 
-    # Ingest interval: accept "8h", "30m", "3600s", or plain seconds integer.
+    # Ingest interval: accept "2h", "30m", "3600s", or plain seconds integer.
     cfg.ingest_interval = _parse_duration_seconds(
-        os.getenv("INGEST_INTERVAL", ""), default=28_800
+        os.getenv("INGEST_INTERVAL", ""), default=7_200
     )
-    # Run timeout must cover the fetch plus up to 7 sequential LLM parse calls.
+    # Run timeout must cover the fetch plus up to 10 sequential LLM parse calls.
     cfg.ingest_timeout = _parse_duration_seconds(
         os.getenv("INGEST_TIMEOUT", ""), default=900
+    )
+    # NULL/empty-field repair check cadence (2 h default).
+    cfg.null_check_interval = _parse_duration_seconds(
+        os.getenv("NULL_CHECK_INTERVAL", ""), default=7_200
     )
 
     # LLMPing (LLM Brain) options.
@@ -189,6 +213,15 @@ def load_config() -> Config:
     # means false so a typo can never accidentally turn sample mode on.
     cfg.sample_data = (
         os.getenv("SAMPLE_DATA", "").strip().lower() in ("1", "true", "yes", "on")
+    )
+
+    # One-shot / one-time flags — same strict truthy set as SAMPLE_DATA.
+    cfg.run_once = (
+        os.getenv("RUN_ONCE", "").strip().lower() in ("1", "true", "yes", "on")
+    )
+    cfg.category_backfill_once = (
+        os.getenv("CATEGORY_BACKFILL_ONCE", "").strip().lower()
+        in ("1", "true", "yes", "on")
     )
 
     return cfg

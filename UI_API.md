@@ -59,15 +59,23 @@ is up, not that the DB is reachable (use `GET /api/stats` for that).
 |------------|--------|---------|---------|----------|
 | `limit`    | int    | 50      | 1–100   | Page size. Outside 1–100 (or non-numeric) → `422`. |
 | `offset`   | int    | 0       | ≥ 0     | Rows to skip. Negative → `422`. |
-| `category` | string | (none)  | —       | Exact match; empty/omitted → no filter. |
+| `category` | string | (none)  | —       | Case-insensitive exact match; empty/omitted → no filter. |
 | `source`   | string | (none)  | —       | Exact match (AND-combined with `category`). |
 
 - **Sorting is fixed**: newest first (`published_at DESC`), with `id ASC`
-  as a stable tiebreaker. No user-configurable sorting or text search.
-- `total` = count of matching rows before pagination → use it for
-  has-more/paging math.
+  as a stable tiebreaker. Pages are stable — same data + same params
+  yields the same rows. No user-configurable sorting or text search.
+- **Pagination and filtering happen in the Turso SQL query** — the backend
+  only retrieves the requested page (plus one sentinel row) from the
+  database, never the whole table.
+- `has_more` = `true` when more matching rows exist beyond this page. It is
+  derived from the sentinel row (`LIMIT limit+1`), so use it directly for
+  paging instead of doing offset math.
+- `total` = count of matching rows before pagination. Kept for backward
+  compatibility with existing UI paging math; `has_more` is the preferred
+  signal going forward.
 - **Valid params always return 200**, even when nothing matches
-  (`articles: []`).
+  (`articles: []`, `has_more: false`).
 
 **200 response (real example):**
 
@@ -87,17 +95,45 @@ is up, not that the DB is reachable (use `GET /api/stats` for that).
   ],
   "total": 1,
   "limit": 50,
-  "offset": 0
+  "offset": 0,
+  "has_more": false
 }
 ```
 
-Examples: `GET /api/news`, `GET /api/news?limit=20&offset=40`,
-`GET /api/news?category=technology&limit=10`.
+Examples: `GET /api/news`, `GET /api/news?limit=5&offset=0`,
+`GET /api/news?limit=5&offset=5`,
+`GET /api/news?category=Technology&limit=5&offset=0`,
+`GET /api/news?category=Technology&limit=5&offset=5`,
+`GET /api/news?limit=20&offset=40`, `GET /api/news?category=technology&limit=10`.
 
 **Errors:** `422` for invalid `limit`/`offset` (FastAPI validation);
 `500 {"error": "...", "code": "INTERNAL_ERROR"}` if the DB query fails.
 
 **422 body:** `{"detail":[{"loc":["query","limit"],"msg":"...","type":"..."}]}`
+
+---
+
+### `GET /api/news/categories` — unique category list
+
+Comes dynamically from the `news` table (one lightweight SQL query:
+`DISTINCT` + non-empty filter, case-insensitive sort in SQL). No LLM,
+no ingestion. Trimmed, deduplicated, alphabetically ordered — suitable
+for a frontend filter dropdown.
+
+**200:**
+
+```json
+{
+  "categories": [
+    "business",
+    "college football",
+    "environment",
+    "politics",
+    "science",
+    "technology"
+  ]
+}
+```
 
 ---
 
@@ -159,7 +195,7 @@ Triggers one full ingestion cycle **synchronously** and returns its result:
 
 ```
 news provider fetch (or samples) → normalize → MAX_ARTICLES cap → URL dedup
-→ upsert into Turso → per-article LLMPing parse → llm_* fields filled
+→ upsert into Turso → per-article LLMPing parse → llm_* fields + category filled
 ```
 
 - Request: no body, no parameters.
@@ -167,7 +203,7 @@ news provider fetch (or samples) → normalize → MAX_ARTICLES cap → URL dedu
 - Each run re-parses its stored articles through LLMPing sequentially, so this
   call can take minutes. Real provider quota is consumed too.
 - The backend also ingests automatically at startup and every
-  `INGEST_INTERVAL` (8 h) — the UI does not need this endpoint to see fresh
+  `INGEST_INTERVAL` (2 h) — the UI does not need this endpoint to see fresh
   data; polling `GET /api/news` is enough.
 - **Not for normal frontend usage:** it is unauthenticated and quota-consuming.
   Surface it only in an admin tool, if at all.
@@ -263,11 +299,12 @@ interface Article {
 **Real mode (`SAMPLE_DATA=false` — default):**
 
 ```
-News API (NewsAPI → GNews → NewsData.io → WebFetch, first success wins)
+News API (NewsAPI → GNews → NewsData.io → WebFetch; providers run in order
+until MAX_ARTICLES usable articles are collected — never in parallel)
    ↓ provider normalization      (internal)
-up to MAX_ARTICLES articles      (7, hard cap)
+up to MAX_ARTICLES articles      (10, hard cap)
    ↓ LLMPing LLM Brain           (internal, per article, sequential)
-parsed answer on the article row (llm_* fields)
+parsed answer on the article row (llm_* fields) + category column
    ↓
 Turso database
    ↓
@@ -309,12 +346,15 @@ Credentials (provider keys, Turso token, LLMPing token) live only in backend
 
 ## Automatic runner
 
-- `INGEST_INTERVAL=8h` — ingestion at startup, then every 8 h (3 runs/day).
-- `MAX_ARTICLES=7` — each run processes **up to** 7 articles (fetched count can
-  be lower; e.g. the provider may return fewer than requested).
+- `INGEST_INTERVAL=2h` — ingestion at startup, then every 2 h (12 runs/day).
+- `MAX_ARTICLES=10` — each run collects **up to** 10 usable articles (fetched
+  count can be lower; e.g. the provider may return fewer than requested).
 - Per run: fetch → normalize → cap at `MAX_ARTICLES` → dedup → store →
-  one sequential LLMPing call per article → retention sweep.
+  one sequential LLMPing call per article → category written to the
+  `category` column → retention sweep.
 - A failed article (LLM error) is logged and skipped — the run continues.
+- `NULL_CHECK_INTERVAL=2h` — a repair pass scans for rows with NULL/empty
+  `category`/`llm_*` fields and fixes only those; healthy rows are untouched.
 
 ## Frontend integration example
 

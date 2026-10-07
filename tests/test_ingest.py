@@ -5,7 +5,7 @@ and the per-article LLM parse phase.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import httpx
@@ -18,6 +18,17 @@ from ingest import build_providers, provider_api_key, run_ingestion
 from models import Article
 
 CHAT_URL = "https://llmping.onrender.com/chat"
+
+
+def _recent_published() -> str:
+    """
+    Fixture articles must sit inside the retention window no matter when the
+    suite runs — hardcoded dates age out of RETENTION_DAYS and the retention
+    sweep silently deletes the rows mid-test.
+    """
+    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def test_build_providers_orders_by_fallback_priority():
@@ -61,7 +72,7 @@ def test_provider_api_key_mapping():
 @pytest.mark.asyncio
 @respx.mock
 async def test_run_ingestion_fetches_and_deduplicates(tmp_db):
-    published = "2026-09-30T10:00:00Z"
+    published = _recent_published()
     body = {
         "status": "ok",
         "articles": [
@@ -89,9 +100,12 @@ async def test_run_ingestion_fetches_and_deduplicates(tmp_db):
     result = await run_ingestion(cfg, tmp_db)
 
     assert result.provider == "newsapi"
-    assert result.total == 3
+    # Dedup now happens while accumulating the fetch set: the duplicate URL
+    # and the title-less entry are dropped before counting, so `total` is
+    # the usable collected set (≤ MAX_ARTICLES).
+    assert result.total == 2
     assert result.inserted == 2
-    assert result.skipped == 1
+    assert result.skipped == 0
     assert count_articles(tmp_db) == 2
 
     # LLM parse phase: one /chat call per stored article.
@@ -124,7 +138,7 @@ async def test_run_ingestion_falls_back_on_failure(tmp_db):
     # Provider 2 (GNews) succeeds
     body = {
         "articles": [
-            {"title": "GNews Story", "url": "https://example.com/gnews", "publishedAt": "2026-09-30T10:00:00Z"}
+            {"title": "GNews Story", "url": "https://example.com/gnews", "publishedAt": _recent_published()}
         ]
     }
     respx.get("https://gnews.io/api/v4/top-headlines").mock(
@@ -156,7 +170,7 @@ async def test_run_ingestion_falls_back_on_failure(tmp_db):
 @respx.mock
 async def test_run_ingestion_caps_articles_at_max_articles(tmp_db):
     """MAX_ARTICLES is a hard cap per run (NewsData ignores page-size → 10 rows)."""
-    published = "2026-09-30T10:00:00Z"
+    published = _recent_published()
     respx.get("https://newsapi.org/v2/everything").mock(
         return_value=httpx.Response(
             200,
@@ -190,7 +204,7 @@ async def test_run_ingestion_caps_articles_at_max_articles(tmp_db):
 @pytest.mark.asyncio
 @respx.mock
 async def test_run_ingestion_llm_failure_skips_article_and_continues(tmp_db):
-    published = "2026-09-30T10:00:00Z"
+    published = _recent_published()
     respx.get("https://newsapi.org/v2/everything").mock(
         return_value=httpx.Response(
             200,
@@ -233,7 +247,7 @@ async def test_run_ingestion_llm_failure_skips_article_and_continues(tmp_db):
 @respx.mock
 async def test_run_ingestion_llm_down_run_completes(tmp_db):
     """LLMPing fully unreachable: run completes, no data fabricated, rows kept."""
-    published = "2026-09-30T10:00:00Z"
+    published = _recent_published()
     respx.get("https://newsapi.org/v2/everything").mock(
         return_value=httpx.Response(
             200,

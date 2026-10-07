@@ -28,7 +28,7 @@ Next.js Frontend  (GET /api/news via this service's HTTP API)
 Browser UI
 ```
 
-The service runs as a long-lived HTTP server. It ingests on startup and then every 8 hours (`INGEST_INTERVAL`). Each run: fetch ≤ `MAX_ARTICLES` (7) articles, store them, then send each one to LLMPing sequentially and persist the parsed answer. **3 runs/day × 7 articles = 21 LLM parse calls/day.** No queue, broker, or worker system — just the existing in-process scheduler.
+The service runs as a long-lived HTTP server. It ingests on startup and then every 2 hours (`INGEST_INTERVAL`). Each run: collect up to `MAX_ARTICLES` (10) usable articles from the provider fallback chain, store them, then send each one to LLMPing sequentially, persist the parsed answer **and its category**. A second lightweight background check (`NULL_CHECK_INTERVAL`, 2h) scans for rows with NULL/empty `category`/`llm_*` fields and repairs only those. **12 runs/day × 10 articles = up to 120 LLM parse calls/day.** No queue, broker, or worker system — just the existing in-process scheduler.
 
 ### Sequential provider fallback
 
@@ -61,7 +61,8 @@ The system prompt is an instruction layer, kept in its own section — it is nev
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/health` | Health liveness check. |
-| `GET` | `/api/news` | Paginated list of articles (with optional `category`/`source` filters). Includes the LLM parse fields when available. |
+| `GET` | `/api/news` | Paginated list of articles (`limit`, `offset`, optional case-insensitive `category`/`source` filters). Pagination + filtering run in the Turso SQL query; `has_more` comes from a `limit+1` sentinel fetch. Includes the LLM parse fields when available. |
+| `GET` | `/api/news/categories` | Unique non-empty categories from the `news` table (SQL-side DISTINCT + trim + case-insensitive sort). |
 | `GET` | `/api/news/{id}` | Get a single article by its deterministic ID. |
 | `POST` | `/api/ingest` | Trigger a manual ingestion + LLM parse run. |
 | `GET` | `/api/stats` | Total article count and last ingestion result (incl. `parsed`/`parse_failed`). |
@@ -204,8 +205,8 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 | `TURSO_DATABASE_URL` | **Yes** | — | Turso connection string (`libsql://name.turso.io`) or local file (`file:./news.db`). |
 | `TURSO_AUTH_TOKEN` | Remote only | `""` | Turso auth token. Leave empty for local files. |
 | `PORT` | No | `8080` | HTTP listen port. Render provides this dynamically. |
-| `INGEST_INTERVAL` | No | `8h` | Background ingestion cadence (3 runs/day). |
-| `INGEST_TIMEOUT` | No | `900s` | Max duration for one run — must cover the fetch plus up to 7 sequential LLMPing calls. |
+| `INGEST_INTERVAL` | No | `2h` | Background ingestion cadence (12 runs/day). |
+| `INGEST_TIMEOUT` | No | `900s` | Max duration for one run — must cover the fetch plus up to 10 sequential LLMPing calls. |
 | `RETENTION_DAYS` | No | `7` | Rolling retention window in days. |
 | `NEWS_API_KEY` | One of four | `""` | NewsAPI key (provider #1). |
 | `GNEWS_API_KEY` | One of four | `""` | GNews key (provider #2). |
@@ -213,7 +214,10 @@ The `url` column has a `UNIQUE` constraint. When the same story appears again, `
 | `WEBFETCH_API_URL` | One of four | `""` | WebFetch base URL (provider #4). |
 | `WEBFETCH_API_KEY` | Conditional | `""` | WebFetch API key (optional). |
 | `NEWS_LANGUAGE` | No | `en` | Article language filter. |
-| `MAX_ARTICLES` | No | `7` | Max articles fetched (and LLM-parsed) per run. |
+| `MAX_ARTICLES` | No | `10` | Max articles collected (and LLM-parsed) per run. |
+| `NULL_CHECK_INTERVAL` | No | `2h` | Cadence of the NULL/empty-field repair check (touches only incomplete rows). |
+| `RUN_ONCE` | No | `false` | `true` + `python main.py`: run backfill (if flagged) → one ingestion → one repair pass → exit. No scheduler, no server. Local testing only. |
+| `CATEGORY_BACKFILL_ONCE` | No | `false` | `true`: on startup, run the ONE-TIME category backfill over existing rows. A `category_backfill_done` marker in the DB meta table makes every later start a no-op. Remove the variable once the migration has run. |
 | `SAMPLE_DATA` | No | `false` | `true`: use bundled sample data (`data/sample_news.json`) instead of real news APIs — testing only, same pipeline otherwise. |
 | `CORS_ALLOW_ORIGINS` | No | `*` | Comma-separated allowed CORS origins. |
 | `LLMPING_BASE_URL` | No | `https://llmping.onrender.com` | LLMPing service base URL. |
@@ -249,7 +253,8 @@ cp .env.example .env
 ### Running
 
 ```bash
-# Run the HTTP server (default port 8080; ingests immediately, then every 8h)
+# Run the HTTP server (default port 8080; ingests immediately, then every 2h,
+# plus a NULL/empty repair check every 2h)
 python main.py
 
 # or with uv (uses the project .venv):
@@ -281,7 +286,7 @@ uv run pytest
 uv run python scripts/test_providers_live.py   # one small real request per configured provider
 uv run python scripts/test_turso_live.py       # Turso write/read/dedup/retention lifecycle
 uv run python scripts/test_llmping_live.py     # {"query": "Hello"} + one real article prompt
-TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=7 uv run python scripts/test_one_cycle_live.py
+TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=10 uv run python scripts/test_one_cycle_live.py
 ```
 
 ### Sample Data Mode
@@ -297,7 +302,7 @@ sample data instead of the real news APIs:
 - Consumes zero news-API quota and still exercises the complete flow, including
   the real LLMPing service (6 sequential calls per run).
 - Set `SAMPLE_DATA=false` (or remove the line) to use the real providers
-  with `MAX_ARTICLES=7` / `INGEST_INTERVAL=8h` exactly as before.
+  with `MAX_ARTICLES=10` / `INGEST_INTERVAL=2h` exactly as before.
 
 Try it end-to-end (writes to a throwaway local DB, never your production one):
 
@@ -395,5 +400,49 @@ See [UI_API.md](./UI_API.md) for full details including `fetch()` examples.
 - The service is **stateless** beyond the database connection. Multiple instances can run behind a load balancer — each will independently attempt ingestion (idempotent due to `ON CONFLICT` dedup and the `UPDATE`-based parse store).
 - The `/health` endpoint does not depend on the database — it checks process liveness only.
 - No authentication is implemented. For production, place behind a reverse proxy (e.g., Cloudflare, Nginx) or Render's built-in networking controls.
-- Ingestion runs in-process via an `asyncio` background task (`INGEST_INTERVAL`). Per-article LLM failures never abort a run; failed articles simply remain un-parsed until the next run refreshes them.
-- Workload is bounded by design: 3 runs/day × 7 articles = 21 LLMPing calls/day.
+- Ingestion runs in-process via an `asyncio` background task (`INGEST_INTERVAL`), alongside a NULL/empty repair task (`NULL_CHECK_INTERVAL`). Per-article LLM failures never abort a run; failed articles simply remain un-parsed until the repair pass retries them.
+- Workload is bounded by design: 12 runs/day × 10 articles = up to 120 LLMPing calls/day.
+
+## Category backfill & NULL/empty repair
+
+### One-time category backfill (existing rows)
+
+The `news` table may predate the category feature. The backfill assigns a
+category to every existing row **using only the data already stored**, in
+order: the stored `llm_answer` JSON → local keyword analysis of the article
+text → one LLM request only when neither can determine a category:
+
+```bash
+uv run python scripts/backfill_categories.py
+```
+
+- A `category_backfill_done` marker is written to the DB `meta` table after a
+  fully successful pass, so re-running the script (or starting the server with
+  `CATEGORY_BACKFILL_ONCE=true`) is a no-op afterwards.
+- The run prints a summary: rows repaired from the stored LLM answer, rows
+  repaired by local analysis, rows that needed the LLM fallback, and rows
+  still incomplete.
+- Setting `CATEGORY_BACKFILL_ONCE=true` runs the same migration once at server
+  startup — handy on a fresh deployment; remove the variable once done.
+
+### NULL/empty repair check (every 2 hours)
+
+A lightweight in-process task runs every `NULL_CHECK_INTERVAL` (default 2h):
+
+- Fetches ONLY rows with a NULL/empty `category`, `llm_answer`,
+  `llm_provider`, `llm_model` or `llm_processed_at` — healthy rows are never
+  fetched, so they are never reprocessed.
+- For each row missing a category, the category is determined in this order:
+  1. from the row's stored `llm_answer` JSON (no LLM request),
+  2. by local keyword analysis of the stored title/description/content/source
+     against the application's existing category vocabulary (no LLM request,
+     no invented category names),
+  3. only as a final fallback, one LLMPing request — a small category query
+     when the row already stores a complete LLM result (which is never
+     overwritten), or a full parse when it doesn't (which also fills the
+     `llm_*` fields in the same request).
+- Rows whose category is already valid are left untouched even if their
+  `llm_*` fields are missing — historical rows are never mass-parsed.
+- No values are invented: if the LLM cannot determine one, the row is left
+  unchanged and retried on the next pass. `description`, `content`,
+  `source`, `author` and `image_url` are never fabricated when absent.

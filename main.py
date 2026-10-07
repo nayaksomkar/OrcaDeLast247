@@ -10,9 +10,11 @@ POST /api/ingest        — trigger a manual ingestion run
 GET  /api/stats         — total article count + last ingestion summary
 
 The server also runs background ingestion on startup and every INGEST_INTERVAL
-seconds (default 8 h = 3 runs/day) using an asyncio background task. Each run:
-fetch up to MAX_ARTICLES (7) articles → store → send each article + the system
-prompt to the LLMPing LLM Brain → store the parsed answer on the row.
+seconds (default 2 h = 12 runs/day) using an asyncio background task, plus a
+NULL/empty repair check every NULL_CHECK_INTERVAL (default 2 h). Each
+ingestion run: collect up to MAX_ARTICLES (10) usable articles → store → send
+each article + the system prompt to the LLMPing LLM Brain → store the parsed
+answer and its category on the row.
 
 Run locally:
     python -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload
@@ -39,10 +41,14 @@ from database import (
     get_article_by_id,
     init_db,
     list_articles,
+    list_categories,
+    meta_get,
+    meta_set,
     open_db,
 )
 from ingest import run_ingestion
 from models import Article, IngestionResult
+from repair import CATEGORY_MARKER_KEY, repair_articles
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -117,11 +123,88 @@ def _log_ingestion_result(r: IngestionResult) -> None:
         "Deleted:    %d stale articles\n"
         "LLM Parsed: %d articles\n"
         "LLM Failed: %d articles\n"
+        "Categorized:%d articles\n"
         "SourceTime: %s\n"
         "=========================",
         r.provider, r.total, r.inserted, r.skipped, r.deleted,
-        r.parsed, r.parse_failed, r.source_time,
+        r.parsed, r.parse_failed, r.categorized, r.source_time,
     )
+
+
+# ---------------------------------------------------------------------------
+# NULL/empty repair + one-time category backfill
+# ---------------------------------------------------------------------------
+
+async def _maybe_category_backfill() -> None:
+    """
+    One-time category backfill over EXISTING rows, gated by the
+    CATEGORY_BACKFILL_ONCE flag and the DB meta marker.
+
+    The marker ("category_backfill_done") is written only after a fully
+    successful pass, so a failed run is retried on the next startup —
+    and a successful one is never repeated.
+    """
+    assert _cfg is not None
+    assert _conn is not None
+
+    if not _cfg.category_backfill_once:
+        return
+    if await asyncio.to_thread(meta_get, _conn, CATEGORY_MARKER_KEY) is not None:
+        logger.info("[backfill] marker present — one-time category backfill skipped")
+        return
+
+    logger.info("[backfill] one-time category backfill over existing rows...")
+    try:
+        result = await asyncio.wait_for(
+            repair_articles(_cfg, _conn), timeout=_cfg.ingest_timeout
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[backfill] timed out after %ds — will retry on next startup",
+            _cfg.ingest_timeout,
+        )
+        return
+    except Exception as exc:
+        logger.error("[backfill] failed: %s — will retry on next startup", exc)
+        return
+
+    if result.failed == 0:
+        await asyncio.to_thread(
+            meta_set, _conn, CATEGORY_MARKER_KEY,
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        logger.info("[backfill] complete, marker written: %s", result)
+    else:
+        logger.warning(
+            "[backfill] %d row(s) failed — marker NOT written, retried next startup",
+            result.failed,
+        )
+
+
+async def _repair_loop() -> None:
+    """
+    Every cfg.null_check_interval seconds (default 2h): scan Turso for rows
+    with NULL/empty important fields and repair them. Only incomplete rows
+    are fetched, so healthy articles are never reprocessed; a failed repair
+    is simply retried on the next pass. Sleeps FIRST — the startup backfill
+    (above) and the initial ingestion cover the startup state.
+    """
+    assert _cfg is not None
+    assert _conn is not None
+
+    while True:
+        await asyncio.sleep(_cfg.null_check_interval)
+        logger.info("[repair] starting scheduled NULL/empty check...")
+        try:
+            await asyncio.wait_for(
+                repair_articles(_cfg, _conn), timeout=_cfg.ingest_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[repair] scheduled pass timed out after %ds", _cfg.ingest_timeout
+            )
+        except Exception as exc:
+            logger.error("[repair] scheduled pass failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -154,18 +237,25 @@ async def lifespan(app: FastAPI):
 
     logger.info("server starting on 0.0.0.0:%s", _cfg.port)
 
-    # Start background ingestion as a fire-and-forget task.
+    # One-time category backfill over EXISTING rows (flag + marker gated).
+    await _maybe_category_backfill()
+
+    # Start background ingestion and the 2h NULL/empty repair check as
+    # fire-and-forget tasks.
     task = asyncio.create_task(_ingestion_loop())
+    repair_task = asyncio.create_task(_repair_loop())
 
     yield  # server is running
 
     # --- Shutdown ---
     logger.info("shutting down server...")
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    repair_task.cancel()
+    for t in (task, repair_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     if _conn:
         try:
             _conn.close()
@@ -263,20 +353,32 @@ async def health_check():
 async def list_articles_endpoint(
     limit: int = Query(default=50, ge=1, le=100, description="Max articles per page (1–100)."),
     offset: int = Query(default=0, ge=0, description="Rows to skip for pagination."),
-    category: str = Query(default="", description="Filter by exact category."),
+    category: str = Query(default="", description="Filter by category (case-insensitive exact match)."),
     source: str = Query(default="", description="Filter by exact source/publisher."),
 ):
     """
-    Paginated list of articles, newest first.
+    Paginated list of articles, newest first (stable order: published_at
+    DESC, id ASC).
 
-    Optional filters: `category` and `source` (exact match, AND-combined).
-    `total` in the response is the count of matching rows before pagination.
+    Pagination and filtering happen entirely in the Turso SQL query — the
+    backend only retrieves the requested page (plus one sentinel row).
+    `has_more` is derived from that sentinel row (limit + 1), so no extra
+    query is needed to detect the end of results.
+
+    Optional filters: `category` (case-insensitive exact match) and `source`
+    (exact match, AND-combined).
+    `total` (count of matching rows before pagination) is kept for backward
+    compatibility with existing UI paging; `has_more` is the preferred
+    signal going forward.
     Always returns 200 — `articles` is [] when nothing matches.
     """
     try:
-        articles, total = await asyncio.to_thread(
-            list_articles, _conn, limit, offset, category, source
+        # Fetch one extra row so has_more is known without a second query.
+        fetched, total = await asyncio.to_thread(
+            list_articles, _conn, limit + 1, offset, category, source
         )
+        has_more = len(fetched) > limit
+        articles = fetched[:limit]
     except Exception as exc:
         logger.error("list_articles failed: %s", exc)
         return _error(500, "failed to fetch articles", "INTERNAL_ERROR")
@@ -286,7 +388,25 @@ async def list_articles_endpoint(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "has_more": has_more,
     }
+
+
+@app.get("/api/news/categories", response_model=None, tags=["articles"])
+async def list_categories_endpoint():
+    """
+    Unique categories currently present in the news table, for filter UIs.
+
+    Built with one SQL query (DISTINCT + NULL/empty filter + ordering in the
+    database) — cheap, static, and never triggers ingestion or the LLM.
+    """
+    try:
+        categories = await asyncio.to_thread(list_categories, _conn)
+    except Exception as exc:
+        logger.error("list_categories failed: %s", exc)
+        return _error(500, "failed to fetch categories", "INTERNAL_ERROR")
+
+    return {"categories": categories}
 
 
 @app.get("/api/news/{article_id}", response_model=None, tags=["articles"])
@@ -335,7 +455,7 @@ async def trigger_ingest():
     Trigger a manual ingestion run synchronously.
 
     The run is bounded by cfg.ingest_timeout (default 900 s) so it can cover
-    the provider fetch plus up to 7 sequential LLMPing parse calls.
+    the provider fetch plus up to 10 sequential LLMPing parse calls.
     Returns the IngestionResult when done.
     Returns 500 if ingestion itself errors (e.g., DB unreachable).
     """
@@ -361,6 +481,42 @@ async def trigger_ingest():
 # Entry point (direct run without uvicorn CLI)
 # ---------------------------------------------------------------------------
 
+async def _run_once_flow(cfg: Config) -> None:
+    """
+    RUN_ONCE=true one-shot flow (local testing): one-time backfill (if the
+    flag and marker say so) → one ingestion run → one NULL/empty repair
+    pass → exit cleanly. No scheduler, no HTTP server.
+    """
+    global _cfg, _conn, _last_result
+    _cfg, _conn = cfg, None
+    conn = None
+    try:
+        conn = open_db(cfg.turso_url, cfg.turso_token)
+        init_db(conn)
+        _conn = conn
+
+        await _maybe_category_backfill()
+
+        logger.info("[run-once] starting single ingestion run...")
+        result = await asyncio.wait_for(
+            run_ingestion(_cfg, _conn), timeout=_cfg.ingest_timeout
+        )
+        _last_result = result
+        _log_ingestion_result(result)
+
+        logger.info("[run-once] starting single NULL/empty repair pass...")
+        await asyncio.wait_for(
+            repair_articles(_cfg, _conn), timeout=_cfg.ingest_timeout
+        )
+        logger.info("[run-once] done — exiting cleanly")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -369,10 +525,15 @@ if __name__ == "__main__":
     load_dotenv(".env", override=False)
     port = int(_os.getenv("PORT", "8080"))
 
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        # Reload is off for production; use --reload flag from CLI for dev.
-    )
+    if load_config().run_once:
+        # RUN_ONCE=true → execute the configured operation once and exit;
+        # no endless local scheduler is left running.
+        asyncio.run(_run_once_flow(load_config()))
+    else:
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=port,
+            log_level="info",
+            # Reload is off for production; use --reload flag from CLI for dev.
+        )

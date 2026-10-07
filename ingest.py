@@ -11,14 +11,18 @@ Data flow (one cycle):
        load data/sample_news.json via sample_data.load_sample_articles()
        instead — every other step below is shared with the real path.
     3. Build eligible provider list (providers with an API key or base URL).
-    4. Try each provider in order; stop on the first that returns ≥1 article.
+    4. Try each provider in order, accumulating usable articles (skipping
+       URL duplicates) until cfg.max_articles are collected or providers
+       are exhausted — later providers only fill the remaining budget.
     5. Normalize ProviderArticle → Article (add id, fetched_at, provider —
        sample data carries its own provider tag per article).
     6. Deduplicate by URL within the run (DB handles cross-run dupes via UNIQUE).
     7. Upsert each valid article into the DB.
-    8. LLM phase: for each upserted article (max cfg.max_articles = 7), send
+    8. LLM phase: for each upserted article (max cfg.max_articles), send
        system prompt + article data to LLMPing /chat and store the parsed
-       answer on the row (llm_* columns). Failures are logged and skipped.
+       answer on the row (llm_* columns). The parsed category is also
+       written to the `category` column (provider-supplied category as
+       fallback). Failures are logged and skipped.
     9. Delete articles older than the retention window.
    10. Return IngestionResult summary.
 """
@@ -36,12 +40,14 @@ from database import (
     count_articles,
     delete_stale_articles,
     save_llm_parse,
+    update_article_fields,
     upsert_article,
 )
 from llmping import build_article_prompt, resolve_system_prompt
 from llmping import chat as llmping_chat
 from models import Article, IngestionResult
 from providers import GNews, NewsAPI, NewsDataIO, Provider, WebFetch
+from repair import extract_category, fallback_category
 import sample_data
 
 logger = logging.getLogger(__name__)
@@ -92,15 +98,21 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
             return result
 
         # --- Sequential fallback loop ---
+        # Accumulate up to cfg.max_articles usable articles across providers:
+        # the first provider is used first; later providers only fill the
+        # remaining budget. Never called in parallel.
         raw_articles = []
+        seen_fetch_urls: set[str] = set()
         winning_provider = ""
 
         for p in provider_list:
+            if len(raw_articles) >= cfg.max_articles:
+                break
             try:
                 fetched = await p.fetch(
                     api_key=provider_api_key(cfg, p.name),
                     lang=cfg.language,
-                    max_articles=cfg.max_articles,
+                    max_articles=cfg.max_articles - len(raw_articles),
                     from_time=from_time,
                 )
             except Exception as exc:
@@ -112,10 +124,17 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
                 logger.warning("[ingest] %s returned 0 articles", p.name)
                 continue
 
-            # First provider with usable articles wins.
-            raw_articles = fetched
-            winning_provider = p.name
-            break
+            # Record the first provider that contributed (reported in stats).
+            if not winning_provider:
+                winning_provider = p.name
+
+            for pa in fetched:
+                if not pa.url or not pa.title or pa.url in seen_fetch_urls:
+                    continue
+                seen_fetch_urls.add(pa.url)
+                raw_articles.append(pa)
+                if len(raw_articles) >= cfg.max_articles:
+                    break
 
     result.provider = winning_provider if not cfg.sample_data else "sample"
     result.total = len(raw_articles)
@@ -127,7 +146,8 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
     # --- Normalize, deduplicate, upsert ---
     # HARD CAP: some providers (NewsData.io) ignore the page-size param and
     # return more rows than requested. MAX_ARTICLES is the per-run budget
-    # (7 → 7 sequential LLM calls), so trim the raw list before processing.
+    # (each stored article → one sequential LLM call), so trim the raw list
+    # before processing.
     now = datetime.now(timezone.utc)
     seen_urls: set[str] = set()
     stored_this_run: list[Article] = []
@@ -205,6 +225,22 @@ async def run_ingestion(cfg: Config, conn: Any) -> IngestionResult:
                 "[ingest] parsed %s via %s/%s",
                 article.url, res.provider or "?", res.model or "?",
             )
+
+            # Category: from the fresh parse result (or the provider's own
+            # category as deterministic fallback) — written to the column
+            # whenever the row does not already have one. A category failure
+            # never taints the parse result; the repair pass will fill it.
+            category = extract_category(res.answer) or fallback_category(article)
+            if category and not article.category:
+                try:
+                    await asyncio.to_thread(
+                        update_article_fields, conn, article.id, {"category": category}
+                    )
+                    result.categorized += 1
+                    logger.info("[ingest] category %r for %s", category, article.url)
+                except Exception as exc:
+                    logger.warning("[ingest] category write failed for %s: %s",
+                                   article.url, exc)
         except Exception as exc:
             logger.warning(
                 "[ingest] LLM parse failed for %s: %s — skipping article",

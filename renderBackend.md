@@ -10,7 +10,7 @@ actual running service (real requests, real captured responses).
 | CORS | Configured via `CORS_ALLOW_ORIGINS` (comma-separated). This deployment currently runs with `*`; setting the env var to e.g. `http://localhost:3000,https://your-frontend.vercel.app` restricts it — allowed origins are echoed exactly, disallowed ones get no CORS header. Preflight answered `200` with `access-control-allow-methods: GET, POST, OPTIONS` and `Content-Type` allowed. The UI can call it from any allowed origin |
 | Methods allowed | `GET`, `POST`, `OPTIONS` |
 
-The backend auto-ingests at startup and every 8 h; the UI only ever **reads**.
+The backend auto-ingests at startup and every 2 h; the UI only ever **reads**.
 Detailed field docs: [`UI_API.md`](./UI_API.md).
 
 ---
@@ -148,13 +148,14 @@ async function loadArticles(limit = 20, offset = 0) {
   const data = await res.json();
   return {
     articles: data.articles,
-    hasMore: data.offset + data.articles.length < data.total,  // offset-based paging
+    hasMore: data.has_more,  // server-side sentinel (limit+1) — preferred
+    // (the old offset-based math still works: data.total is kept for compat)
   };
 }
 ```
 
 - **Poll `GET /api/news`** (e.g. on load + when the user refreshes). New data
-  arrives automatically every 8 h — no other trigger exists.
+  arrives automatically every 2 h — no other trigger exists.
 - **Never call `POST /api/ingest`** from the product UI — it can take minutes
   and burns provider/LLM quota. It exists for admin/testing.
 - `llm_answer` is a JSON string on the wire. With the shipped editorial prompt

@@ -1,11 +1,11 @@
 """
 scripts/test_one_cycle_live.py — Run exactly ONE complete ingestion + LLM cycle.
 
-Flow: providers (max MAX_ARTICLES, default 7) → normalize/upsert → per-article
-LLMPing parse (sequential) → parsed answers stored in Turso.
+Flow: providers (max MAX_ARTICLES, default 10) → normalize/upsert → per-article
+LLMPing parse (sequential) → parsed answers + categories stored in Turso.
 
 Usage:
-    TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=7 python scripts/test_one_cycle_live.py
+    TURSO_DATABASE_URL=file:./news.db MAX_ARTICLES=10 python scripts/test_one_cycle_live.py
 
 Requires at least one news provider API key and network access to the
 providers and to LLMPING_BASE_URL. This performs REAL fetches and REAL

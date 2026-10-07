@@ -44,12 +44,15 @@ def test_load_config_applies_defaults(monkeypatch):
     assert cfg.turso_url == "file:./test.db"
     assert cfg.turso_token == ""
     assert cfg.retention_days == 7
-    assert cfg.max_articles == 7
+    assert cfg.max_articles == 10
     assert cfg.language == "en"
     assert cfg.port == "8080"
-    assert cfg.ingest_interval == 28_800          # 8h — 3 runs/day
-    assert cfg.ingest_timeout == 900              # covers 7 sequential LLM calls
+    assert cfg.ingest_interval == 7_200          # 2h — 12 runs/day
+    assert cfg.ingest_timeout == 900             # covers 10 sequential LLM calls
     assert cfg.cors_origins == ["*"]
+    assert cfg.run_once is False
+    assert cfg.category_backfill_once is False
+    assert cfg.null_check_interval == 7_200      # 2h repair check
 
 
 def test_load_config_llmping_defaults(monkeypatch):
@@ -135,7 +138,7 @@ def test_load_config_ignores_invalid_numeric_values(monkeypatch):
     cfg = load_config()
     # Bad values → defaults stay in effect
     assert cfg.retention_days == 7
-    assert cfg.max_articles == 7
+    assert cfg.max_articles == 10
 
 
 def test_load_config_reads_provider_keys(monkeypatch):
@@ -152,6 +155,43 @@ def test_load_config_reads_provider_keys(monkeypatch):
     assert cfg.newsdata_api_key == "ndk"
     assert cfg.webfetch_api_url == "https://api.example.com/news"
     assert cfg.webfetch_api_key == "wk"
+
+
+# ---------------------------------------------------------------------------
+# One-shot / scheduling flags
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "on"])
+def test_run_once_and_backfill_truthy(monkeypatch, value):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    monkeypatch.setenv("RUN_ONCE", value)
+    monkeypatch.setenv("CATEGORY_BACKFILL_ONCE", value)
+    cfg = load_config()
+    assert cfg.run_once is True
+    assert cfg.category_backfill_once is True
+
+
+@pytest.mark.parametrize("value", ["false", "0", "", "no", "bogus"])
+def test_run_once_and_backfill_falsy(monkeypatch, value):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    monkeypatch.setenv("RUN_ONCE", value)
+    monkeypatch.setenv("CATEGORY_BACKFILL_ONCE", value)
+    cfg = load_config()
+    assert cfg.run_once is False
+    assert cfg.category_backfill_once is False
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("2h", 7_200),
+    ("30m", 1_800),
+    ("3600", 3_600),
+    ("", 7_200),      # empty → default
+    ("bad", 7_200),   # invalid → default
+])
+def test_null_check_interval_parsing(monkeypatch, value, expected):
+    monkeypatch.setenv("TURSO_DATABASE_URL", "file:./test.db")
+    monkeypatch.setenv("NULL_CHECK_INTERVAL", value)
+    assert load_config().null_check_interval == expected
 
 
 # ---------------------------------------------------------------------------

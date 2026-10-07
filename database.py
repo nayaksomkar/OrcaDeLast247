@@ -19,6 +19,11 @@ list_articles(conn, ...)             → ([Article], total_count)
 get_article_by_id(conn, id)          → Article | None
 count_articles(conn)                 → int
 delete_stale_articles(conn, days)    → int (rows deleted)
+meta_get(conn, key)                  → str | None   (meta table)
+meta_set(conn, key, value)           → None
+list_incomplete_articles(conn)       → [Article]    (rows with NULL/empty fields)
+update_article_fields(conn, id, {col: value})
+                                     → int (rows updated; whitelisted columns only)
 
 All blocking DB calls are wrapped with asyncio.to_thread() in the ingestion
 and API layers so they don't block the FastAPI event loop.
@@ -135,6 +140,10 @@ def init_db(conn: Any) -> None:
 
     Also adds the LLM parse-result columns (idempotent ALTER TABLE ADD COLUMN),
     so databases created before the LLM phase get them transparently.
+
+    A tiny `meta` key/value table is created here too — used only for
+    run-once markers (e.g. the category-backfill-done flag). It holds no
+    article data and is never queried by the API.
     """
     schema = """
 CREATE TABLE IF NOT EXISTS news (
@@ -153,6 +162,10 @@ CREATE TABLE IF NOT EXISTS news (
 );
 CREATE INDEX IF NOT EXISTS idx_news_published_at ON news (published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_url          ON news (url);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
     with _sqlite_lock:
         conn.executescript(schema)
@@ -341,13 +354,15 @@ def list_articles(
     Ordering: published_at DESC (newest first), id ASC as tiebreaker for
     stable pagination when multiple articles share the same timestamp.
 
-    Filters: category and source are exact-match WHERE clauses (AND-combined).
+    Filters: category (case-insensitive exact match) and source (exact
+    match) are WHERE clauses (AND-combined) — filtering and pagination
+    happen entirely in SQL, only the requested page is fetched.
     """
     conditions: list[str] = []
     args: tuple[Any, ...] = ()
 
     if category:
-        conditions.append("category = ?")
+        conditions.append("LOWER(category) = LOWER(?)")
         args += (category,)
     if source:
         conditions.append("source = ?")
@@ -398,6 +413,34 @@ def count_articles(conn: Any) -> int:
     return row[0] if row else 0
 
 
+def list_categories(conn: Any) -> list[str]:
+    """
+    Return the unique, non-empty categories currently stored in the news
+    table, case-insensitively sorted for a stable frontend dropdown.
+
+    One lightweight SQL query: DISTINCT, the NULL/empty filter and the
+    ordering all happen inside the database — the whole table is never
+    loaded into Python.
+    """
+    with _sqlite_lock:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM news "
+            "WHERE category IS NOT NULL AND TRIM(category) != '' "
+            "ORDER BY LOWER(TRIM(category))"
+        ).fetchall()
+
+    # Strip defensively and dedupe (a DISTINCT on the raw value could still
+    # yield two values that are equal after trimming whitespace).
+    seen: set[str] = set()
+    categories: list[str] = []
+    for row in rows:
+        cat = (row[0] or "").strip()
+        if cat and cat not in seen:
+            seen.add(cat)
+            categories.append(cat)
+    return categories
+
+
 def delete_stale_articles(conn: Any, retention_days: int) -> int:
     """
     Delete articles published more than retention_days ago.
@@ -415,6 +458,95 @@ def delete_stale_articles(conn: Any, retention_days: int) -> int:
     with _sqlite_lock:
         cursor = conn.execute(
             "DELETE FROM news WHERE published_at < ?", (cutoff,)
+        )
+        conn.commit()
+
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Meta key/value store — run-once markers (e.g. category backfill done)
+# ---------------------------------------------------------------------------
+
+def meta_get(conn: Any, key: str) -> Optional[str]:
+    """Return the value for a meta key, or None when the key does not exist."""
+    with _sqlite_lock:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def meta_set(conn: Any, key: str, value: str) -> None:
+    """Insert or overwrite a meta key (idempotent)."""
+    with _sqlite_lock:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# NULL/empty-field repair support
+# ---------------------------------------------------------------------------
+
+# Columns the repair pass may write. Anything outside this whitelist is
+# rejected — update_article_fields() can never touch id/url/published_at.
+_UPDATABLE_COLUMNS: frozenset[str] = frozenset({
+    "category", "description", "content", "source", "author", "image_url",
+    "llm_answer", "llm_provider", "llm_model", "llm_processed_at",
+})
+
+
+def list_incomplete_articles(conn: Any) -> list[Article]:
+    """
+    Return every article that has at least one NULL/empty important field:
+    category, llm_answer, llm_provider, llm_model or llm_processed_at.
+
+    Healthy rows are never returned, so repair passes only ever touch
+    incomplete records. description/content/source/author/image_url are NOT
+    part of this predicate — they cannot be repaired without fabricating
+    content, so an article missing only those is considered healthy here.
+    """
+    with _sqlite_lock:
+        rows = conn.execute(
+            f"SELECT {_SELECT_COLS} FROM news WHERE "
+            "category IS NULL OR TRIM(category) = '' OR "
+            "llm_answer IS NULL OR TRIM(llm_answer) = '' OR "
+            "llm_provider IS NULL OR TRIM(llm_provider) = '' OR "
+            "llm_model IS NULL OR TRIM(llm_model) = '' OR "
+            "llm_processed_at IS NULL OR TRIM(llm_processed_at) = '' "
+            "ORDER BY published_at DESC, id ASC"
+        ).fetchall()
+
+    return [_row_to_article(r) for r in rows]
+
+
+def update_article_fields(
+    conn: Any, article_id_val: str, fields: dict[str, Any]
+) -> int:
+    """
+    Update ONLY the given columns on one article row.
+
+    Column names are validated against _UPDATABLE_COLUMNS (defense against
+    dynamic-SQL injection); values are always bound parameters. Used by the
+    category backfill and the NULL/empty repair pass so they can never
+    clobber id/url/published_at or other valid data.
+
+    Returns the number of rows updated (0 = article_id not found).
+    """
+    clean: dict[str, Any] = {
+        k: v for k, v in fields.items() if k in _UPDATABLE_COLUMNS
+    }
+    if not clean:
+        return 0
+
+    set_sql = ", ".join(f"{col} = ?" for col in clean)
+    args = (*clean.values(), article_id_val)
+
+    with _sqlite_lock:
+        cursor = conn.execute(
+            f"UPDATE news SET {set_sql} WHERE id = ?", args
         )
         conn.commit()
 

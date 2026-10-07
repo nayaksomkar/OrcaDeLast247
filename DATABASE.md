@@ -238,6 +238,6 @@ turso> SELECT COUNT(*) FROM news;
 The `llm_*` columns are the database's interface to the LLM Brain. The LLMPing service (external, `https://llmping.onrender.com`) does the actual inference — OrcaDeLast247 only orchestrates:
 
 1. **Clean input**: Deduplicated, normalized article rows (author/category/source standardized across providers) are the prompt payload.
-2. **Per-article parse**: Each run sends up to 7 articles, one at a time, with the configured system prompt (`LLM_SYSTEM_PROMPT`) plus the article data. The parsed reply is stored as received in `llm_answer` — the database remains the final persistent storage.
+2. **Per-article parse**: Each run sends up to 10 articles, one at a time, with the configured system prompt (`LLM_SYSTEM_PROMPT`) plus the article data. The parsed reply is stored as received in `llm_answer`, and its `category` value is written to the `category` column — the database remains the final persistent storage. A repair pass every 2 hours re-processes only rows still missing `category`/`llm_*` values.
 3. **Provenance**: `llm_provider` and `llm_model` record which backend LLMPing used, and `llm_processed_at` records when.
 4. **Read access**: Parsed results are exposed through the backend HTTP API (`GET /api/news` returns the `llm_*` fields on each article) — see [UI_API.md](./UI_API.md). The frontend never queries the database directly; SQL access is for operators/debugging only (see section 7).
