@@ -1,8 +1,9 @@
 # Last247 News API Service
 
-![LAST247 Backend](https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_backend.png)
-
-![LAST247 News Parser](https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_NEWS_PARSER.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_LLM_1.PNG" width="48%" alt="News ingestion: scheduled fetch with provider fallback" />
+  <img src="https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_LLM_2.png" width="48%" alt="LLM parse pipeline: prompt, structured extraction, validation, Turso save" />
+</p>
 
 A Python (FastAPI) HTTP service that fetches news from external providers (NewsAPI, GNews, NewsData.io, WebFetch), normalizes and deduplicates articles into a Turso database, parses each article with the external **LLMPing** LLM Brain, and serves the processed articles via a JSON HTTP API for the Last247 Next.js frontend.
 
