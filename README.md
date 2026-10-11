@@ -1,6 +1,10 @@
 # Last247 News API Service
 
 <p align="center">
+  <img src="https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_backend.png" alt="Last247 backend architecture" />
+</p>
+
+<p align="center">
   <img src="https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_LLM_1.PNG" width="48%" alt="News ingestion: scheduled fetch with provider fallback" />
   <img src="https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_LLM_2.png" width="48%" alt="LLM parse pipeline: prompt, structured extraction, validation, Turso save" />
 </p>
