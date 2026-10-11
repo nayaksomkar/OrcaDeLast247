@@ -1,5 +1,9 @@
 # Last247 News API Service
 
+![LAST247 Backend](https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_backend.png)
+
+![LAST247 News Parser](https://raw.githubusercontent.com/nayaksomkar/OrcaDeLast247/main/LAST247_NEWS_PARSER.png)
+
 A Python (FastAPI) HTTP service that fetches news from external providers (NewsAPI, GNews, NewsData.io, WebFetch), normalizes and deduplicates articles into a Turso database, parses each article with the external **LLMPing** LLM Brain, and serves the processed articles via a JSON HTTP API for the Last247 Next.js frontend.
 
 OrcaDeLast247 never runs a model itself. All inference happens in the external LLMPing service (`https://llmping.onrender.com`) — this project only orchestrates: fetch → store → send system prompt + article to LLMPing → store the parsed answer.
